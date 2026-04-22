@@ -1,0 +1,45 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+.env
+.env.local
+.env.*.local
+
+# Modal
+.modal.toml
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# Model weights / caches (should never commit)
+*.pt
+*.pth
+*.safetensors
+*.bin
+.cache/
+hf-cache/
+
+# Test outputs
+test-output/
+*.png.out
+*.webp.out
+tmp/
