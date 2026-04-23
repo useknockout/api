@@ -185,6 +185,29 @@ class Knockout:
         def health():
             return {"status": "ok", "model": MODEL_REPO}
 
+        @web.get("/remove")
+        def remove_info():
+            return {
+                "error": "Use POST with multipart/form-data",
+                "method": "POST",
+                "body": "multipart form with field 'file'",
+                "headers": {"Authorization": "Bearer <token>"},
+                "example_curl": "curl -X POST https://useknockout--api.modal.run/remove -H 'Authorization: Bearer <token>' -F 'file=@image.jpg' -o out.png",
+                "docs": "https://useknockout--api.modal.run/docs",
+                "sdk": "npm i @useknockout/node",
+            }
+
+        @web.get("/remove-url")
+        def remove_url_info():
+            return {
+                "error": "Use POST with JSON body",
+                "method": "POST",
+                "body": {"url": "https://example.com/image.jpg", "format": "png"},
+                "headers": {"Authorization": "Bearer <token>", "Content-Type": "application/json"},
+                "docs": "https://useknockout--api.modal.run/docs",
+                "sdk": "npm i @useknockout/node",
+            }
+
         @web.post("/remove")
         def remove_endpoint(
             file: UploadFile = File(...),
