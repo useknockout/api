@@ -46,11 +46,21 @@ Input → Output:
 
 ## Quick start
 
+### Public beta token — copy, paste, try it right now
+
+During public beta, everyone shares this bearer token:
+
+```
+kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f
+```
+
+No signup. Just use it. We're free during beta. Paid tier launches soon — need your own key or higher limits? DM [@useknockout](https://x.com/useknockout).
+
 ### Hit the API in 3 seconds
 
 ```bash
 curl -X POST "https://useknockout--api.modal.run/remove" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
   -F "file=@your-image.jpg" \
   -o out.png
 ```
@@ -61,7 +71,7 @@ You get a PNG with a transparent alpha channel. Done.
 
 ```bash
 curl -X POST "https://useknockout--api.modal.run/remove-url" \
-  -H "Authorization: Bearer YOUR_TOKEN" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
   -H "Content-Type: application/json" \
   -d '{"url":"https://example.com/cat.jpg"}' \
   -o out.png
@@ -155,7 +165,7 @@ Interactive OpenAPI (Swagger) UI.
 import requests
 
 URL = "https://useknockout--api.modal.run/remove"
-TOKEN = "YOUR_TOKEN"
+TOKEN = "kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f"  # public beta token
 
 with open("input.jpg", "rb") as f:
     resp = requests.post(
