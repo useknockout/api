@@ -101,12 +101,18 @@ class Knockout:
         self.to_pil = transforms.ToPILImage()
 
     def _check_auth(self, authorization: Optional[str]) -> None:
-        expected = os.environ.get("API_TOKEN")
-        if not expected:
+        raw = os.environ.get("API_TOKEN", "").strip()
+        if not raw:
+            return  # no tokens configured → open API (dev only)
+
+        valid = {t.strip() for t in raw.split(",") if t.strip()}
+        if not valid:
             return
+
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Missing bearer token")
-        if authorization.split(" ", 1)[1] != expected:
+        presented = authorization.split(" ", 1)[1].strip()
+        if presented not in valid:
             raise HTTPException(status_code=403, detail="Invalid token")
 
     def _check_format(self, fmt: str) -> str:
