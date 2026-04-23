@@ -43,3 +43,11 @@ test-output/
 *.png.out
 *.webp.out
 tmp/
+
+# Internal strategy / pricing / architecture docs — never commit
+COMMERCIAL_PLAN.md
+INTERNAL_*.md
+*.private.md
+notes/
+scratch/
+planning/
