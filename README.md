@@ -1,6 +1,31 @@
-# useknockout
+ <div align="center">
 
-> State-of-the-art background removal. Open source. 40x cheaper than remove.bg.
+  # 🥊 useknockout
+
+  **State-of-the-art background removal API — open source, self-hostable, 40× cheaper than remove.bg.**
+
+  [![MIT License](https://img.shields.io/badge/license-MIT-3da639)](./LICENSE)
+  [![npm version](https://img.shields.io/npm/v/@useknockout/node?color=cb3837)](https://www.npmjs.com/package/@useknockout/node)
+  [![npm downloads](https://img.shields.io/npm/dm/@useknockout/node?color=cb3837)](https://www.npmjs.com/package/@useknockout/node)
+  [![GitHub stars](https://img.shields.io/github/stars/useknockout/api?style=social)](https://github.com/useknockout/api)
+  [![Powered by Modal](https://img.shields.io/badge/powered%20by-Modal-7c3aed)](https://modal.com)
+  [![Model: BiRefNet](https://img.shields.io/badge/model-BiRefNet-ff6f00)](https://github.com/ZhengPeng7/BiRefNet)
+  [![Python](https://img.shields.io/badge/python-3.11-3776ab?logo=python&logoColor=white)](https://python.org)
+  [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178c6?logo=typescript&logoColor=white)](https://www.npmjs.com/package/@useknockout/node)
+
+  [**Live API**](https://useknockout--api.modal.run) · [**Docs**](https://useknockout--api.modal.run/docs) · [**Quick Start**](#quick-start) · [**API Reference**](#api-reference) ·
+  [**Self-hosting**](#self-hosting)
+
+  <br/>
+
+  <img src="./docs/hero.png" alt="useknockout before/after — background removal demo" width="800"/>
+
+  <br/>
+
+  *Drop an image in. Get a transparent PNG out. ~200ms per call.*
+
+</div>
+
 
 A production-grade background removal API powered by [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) — the current SOTA on DIS5K, HRSOD, and COD benchmarks. Served on Modal's GPU infrastructure with scale-to-zero economics.
 
