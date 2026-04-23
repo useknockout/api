@@ -35,6 +35,10 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 - **MIT licensed** — model weights and code, commercial use OK
 - **Self-hostable** — deploy to your own Modal workspace in one command
 
+  
+*Works alpha-preserving (PNG with transparent bg) OR opaque (solid color / remote image as new bg).*
+   
+
 ---
 
 ## Table of contents
@@ -47,7 +51,6 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 - [Self-hosting](#self-hosting)
 - [Architecture](#architecture)
 - [Pricing](#pricing)
-- [Roadmap](#roadmap)
 - [License](#license)
 
 ---
