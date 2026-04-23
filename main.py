@@ -19,8 +19,6 @@ Test (remote URL):
       -d '{"url":"https://example.com/cat.jpg"}' \
       -o cat-nobg.png
 """
-from __future__ import annotations
-
 import io
 import os
 from typing import Optional
@@ -62,6 +60,19 @@ image = (
     .run_function(_download_model)
 )
 
+# Module-level imports available inside the container only.
+# This lets FastAPI resolve UploadFile/Header/etc. via get_type_hints().
+with image.imports():
+    import requests
+    import torch
+    from fastapi import FastAPI, File, Header, HTTPException, UploadFile
+    from fastapi.middleware.cors import CORSMiddleware
+    from fastapi.responses import Response
+    from PIL import Image, UnidentifiedImageError
+    from pydantic import BaseModel, HttpUrl
+    from torchvision import transforms
+    from transformers import AutoModelForImageSegmentation
+
 app = modal.App(APP_NAME, image=image)
 
 
@@ -70,16 +81,11 @@ app = modal.App(APP_NAME, image=image)
     scaledown_window=60,
     timeout=600,
     max_containers=10,
-    secrets=[modal.Secret.from_name("knockout-secrets", create_if_missing=True)],
+    secrets=[modal.Secret.from_name("knockout-secrets")],
 )
 class Knockout:
     @modal.enter()
     def load(self) -> None:
-        import torch
-        from torchvision import transforms
-        from transformers import AutoModelForImageSegmentation
-
-        self.torch = torch
         torch.set_float32_matmul_precision("high")
 
         self.model = AutoModelForImageSegmentation.from_pretrained(
@@ -95,8 +101,6 @@ class Knockout:
         self.to_pil = transforms.ToPILImage()
 
     def _check_auth(self, authorization: Optional[str]) -> None:
-        from fastapi import HTTPException
-
         expected = os.environ.get("API_TOKEN")
         if not expected:
             return
@@ -106,31 +110,26 @@ class Knockout:
             raise HTTPException(status_code=403, detail="Invalid token")
 
     def _check_format(self, fmt: str) -> str:
-        from fastapi import HTTPException
-
         fmt = fmt.lower()
         if fmt not in {"png", "webp"}:
             raise HTTPException(400, "format must be 'png' or 'webp'")
         return fmt
 
     def _open_image(self, data: bytes):
-        from fastapi import HTTPException
-        from PIL import Image, UnidentifiedImageError
-
         if len(data) > MAX_IMAGE_BYTES:
             raise HTTPException(413, f"Image exceeds {MAX_IMAGE_BYTES // (1024 * 1024)} MB limit")
         try:
-            image = Image.open(io.BytesIO(data))
-            image.load()
-            return image
+            image_obj = Image.open(io.BytesIO(data))
+            image_obj.load()
+            return image_obj
         except (UnidentifiedImageError, OSError):
             raise HTTPException(400, "Invalid or unsupported image")
 
-    def _remove(self, image):
-        original_size = image.size
-        rgb = image.convert("RGB")
+    def _remove(self, image_obj):
+        original_size = image_obj.size
+        rgb = image_obj.convert("RGB")
         tensor = self.transform(rgb).unsqueeze(0).to("cuda").half()
-        with self.torch.no_grad():
+        with torch.no_grad():
             preds = self.model(tensor)[-1].sigmoid().cpu()
         pred = preds[0].squeeze().float()
         mask = self.to_pil(pred).resize(original_size)
@@ -138,24 +137,18 @@ class Knockout:
         result.putalpha(mask)
         return result
 
-    def _encode(self, image, fmt: str) -> bytes:
+    def _encode(self, image_out, fmt: str) -> bytes:
         buf = io.BytesIO()
-        image.save(buf, format="PNG" if fmt == "png" else "WEBP", optimize=True)
+        image_out.save(buf, format="PNG" if fmt == "png" else "WEBP", optimize=True)
         return buf.getvalue()
 
     def _response(self, image_out, fmt: str):
-        from fastapi.responses import Response
-
         content = self._encode(image_out, fmt)
         media_type = "image/png" if fmt == "png" else "image/webp"
         return Response(content=content, media_type=media_type)
 
     @modal.asgi_app(label="api")
     def fastapi_app(self):
-        from fastapi import FastAPI, File, Header, HTTPException, UploadFile
-        from fastapi.middleware.cors import CORSMiddleware
-        from pydantic import BaseModel, HttpUrl
-
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal API.",
@@ -195,8 +188,8 @@ class Knockout:
             self._check_auth(authorization)
             fmt = self._check_format(format)
             data = file.file.read()
-            image = self._open_image(data)
-            result = self._remove(image)
+            image_obj = self._open_image(data)
+            result = self._remove(image_obj)
             return self._response(result, fmt)
 
         @web.post("/remove-url")
@@ -204,8 +197,6 @@ class Knockout:
             body: UrlBody,
             authorization: Optional[str] = Header(default=None),
         ):
-            import requests
-
             self._check_auth(authorization)
             fmt = self._check_format(body.format)
 
@@ -215,8 +206,8 @@ class Knockout:
             except requests.RequestException as e:
                 raise HTTPException(400, f"Could not fetch image: {e}")
 
-            image = self._open_image(resp.content)
-            result = self._remove(image)
+            image_obj = self._open_image(resp.content)
+            result = self._remove(image_obj)
             return self._response(result, fmt)
 
         return web
