@@ -105,6 +105,42 @@ curl -X POST "https://useknockout--api.modal.run/remove-url" \
   -o out.png
 ```
 
+### Replace the background with a color or remote image
+
+```bash
+# solid color background
+curl -X POST "https://useknockout--api.modal.run/replace-bg" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@cat.jpg" \
+  -F "bg_color=#FF5733" \
+  -F "format=jpg" \
+  -o out.jpg
+
+# use a remote image as the new background
+curl -X POST "https://useknockout--api.modal.run/replace-bg" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@cat.jpg" \
+  -F "bg_url=https://example.com/mountains.jpg" \
+  -o out.png
+```
+
+### Batch — process up to 10 images in one call
+
+```bash
+# multipart batch
+curl -X POST "https://useknockout--api.modal.run/remove-batch?format=png" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "files=@a.jpg" -F "files=@b.jpg" -F "files=@c.jpg"
+
+# URL batch — JSON body
+curl -X POST "https://useknockout--api.modal.run/remove-batch-url" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Content-Type: application/json" \
+  -d '{"urls":["https://a.jpg","https://b.jpg"], "format":"png"}'
+```
+
+Both return JSON: `{ "count": N, "format": "png", "results": [{ "success": true, "data_base64": "..." }, ...] }`.
+
 ### Health check
 
 ```bash
@@ -165,6 +201,78 @@ Fetch an image from a URL and remove its background.
 
 **Response** — same as `/remove`.
 
+### `POST /replace-bg`
+
+Remove the background and composite the subject onto a new background — solid color or a remote image.
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `Authorization` | Yes | `Bearer <API_TOKEN>` |
+| `Content-Type` | Auto | `multipart/form-data` (set by your client) |
+
+**Body** — `multipart/form-data`
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `file` | binary | Yes | Foreground image to process. Max 25 MB. |
+| `bg_color` | string | No (default `#FFFFFF`) | Hex color for the new background. Examples: `#000000`, `#ff5733`, `#1a73e8`. |
+| `bg_url` | string | No | Remote URL of a background image. Takes precedence over `bg_color`. |
+| `format` | string | No (default `png`) | Output format: `png`, `webp`, or `jpg` (smallest, opaque only). |
+
+**Response** — `image/png`, `image/webp`, or `image/jpeg` with the subject composited onto the new background. Edges are cleaned via closed-form foreground matting (no color spill, no halo).
+
+### `POST /remove-batch`
+
+Remove backgrounds from up to 10 images in one call.
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `Authorization` | Yes | `Bearer <API_TOKEN>` |
+| `Content-Type` | Auto | `multipart/form-data` |
+
+**Body** — `multipart/form-data` with repeated `files` fields.
+
+**Query params**
+
+| Param | Type | Default | Description |
+|---|---|---|---|
+| `format` | string | `png` | `png` or `webp`. Applies to every result. |
+
+**Response** — JSON:
+
+```json
+{
+  "count": 3,
+  "format": "png",
+  "results": [
+    { "filename": "a.jpg", "success": true, "format": "png", "size_bytes": 124503, "data_base64": "..." },
+    { "filename": "b.jpg", "success": true, "format": "png", "size_bytes": 98321, "data_base64": "..." },
+    { "filename": "c.jpg", "success": false, "error": "Invalid or unsupported image" }
+  ]
+}
+```
+
+Each `data_base64` decodes to PNG/WebP bytes with a transparent background.
+
+### `POST /remove-batch-url`
+
+Same as `/remove-batch` but takes a JSON array of remote URLs.
+
+**Body** — JSON:
+
+```json
+{
+  "urls": ["https://example.com/a.jpg", "https://example.com/b.jpg"],
+  "format": "png"
+}
+```
+
+**Response** — same JSON shape as `/remove-batch`, with `url` in place of `filename`.
+
 ### `GET /health`
 
 Returns `{"status":"ok","model":"ZhengPeng7/BiRefNet"}`. No auth required.
@@ -177,11 +285,15 @@ Interactive OpenAPI (Swagger) UI.
 
 | Code | Meaning |
 |---|---|
-| `400` | Invalid image, missing field, or malformed URL |
+| `400` | Invalid image, missing field, malformed URL, invalid hex color, or batch > 10 items |
 | `401` | Missing `Authorization` header |
 | `403` | Invalid bearer token |
 | `413` | Image exceeds 25 MB limit |
 | `500` | Server error (check dashboard logs) |
+
+### Edge quality
+
+All endpoints apply closed-form foreground matting (via [pymatting](https://github.com/pymatting/pymatting)) after mask prediction. This estimates pure foreground color at soft edges, eliminating color spill from the original background. Result: no halos, no fringing, even on backgrounds that differ sharply from the subject.
 
 ---
 
@@ -207,7 +319,46 @@ with open("output.png", "wb") as f:
     f.write(resp.content)
 ```
 
-### Node.js (fetch)
+### Node.js SDK (recommended)
+
+```bash
+npm i @useknockout/node
+```
+
+```ts
+import { writeFile } from "node:fs/promises";
+import { Knockout } from "@useknockout/node";
+
+const client = new Knockout({ token: process.env.KNOCKOUT_TOKEN! });
+
+// 1. Remove background → transparent PNG
+const png = await client.remove({ file: "./input.jpg" });
+await writeFile("out.png", png);
+
+// 2. Replace background with a color
+const jpg = await client.replaceBackground({
+  file: "./input.jpg",
+  bgColor: "#FF5733",
+  format: "jpg",
+});
+await writeFile("out.jpg", jpg);
+
+// 3. Replace background with a remote image
+const composed = await client.replaceBackground({
+  file: "./input.jpg",
+  bgUrl: "https://example.com/mountains.jpg",
+});
+
+// 4. Batch — process 10 URLs in one call
+const batch = await client.removeBatchUrl({
+  urls: ["https://example.com/a.jpg", "https://example.com/b.jpg"],
+});
+for (const r of batch.results) {
+  if (r.success) await writeFile(`out-${r.url}.png`, Buffer.from(r.data_base64!, "base64"));
+}
+```
+
+### Node.js (raw fetch, no SDK)
 
 ```js
 import { readFile, writeFile } from "node:fs/promises";
