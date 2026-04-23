@@ -38,11 +38,34 @@ Thumbs.db
 .cache/
 hf-cache/
 
-# Test outputs
+# Test outputs + local testing artifacts
 test-output/
+tmp/
 *.png.out
 *.webp.out
-tmp/
+
+# Local test images (never commit — repo stays clean)
+test-*.png
+test-*.jpg
+test-*.webp
+out-*.png
+out-*.jpg
+out-*.webp
+stress-*.png
+stress-*.jpg
+stress-*.webp
+batch-*.png
+batch-*.jpg
+batch-result.json
+admin-test.*
+public-test.*
+
+# Local scratch folder — all testing artifacts go here
+.local/
+
+# Allow hero image for README
+!docs/hero.png
+!docs/hero.jpg
 
 # Internal strategy / pricing / architecture docs — never commit
 COMMERCIAL_PLAN.md
