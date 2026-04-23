@@ -374,19 +374,6 @@ Credits never expire. No subscriptions. You only pay for what you use.
 
 ---
 
-## Roadmap
-
-- [x] BiRefNet on L4 with FastAPI ASGI (shipped)
-- [ ] Optional post-processing: matting refinement, edge smoothing
-- [ ] SAM 2 prompt-driven mode (click to keep/remove a region)
-- [ ] Batch endpoint (`POST /remove-batch` with N images)
-- [ ] Webhook callbacks for async processing
-- [ ] CDN cache for repeat images (content-hash keyed)
-- [ ] Official SDKs: `@useknockout/node`, `useknockout` (PyPI)
-- [ ] Self-serve dashboard + Stripe billing
-
----
-
 ## Contact
 
 - **GitHub Issues:** https://github.com/useknockout/api/issues
