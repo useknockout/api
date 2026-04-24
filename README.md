@@ -141,6 +141,45 @@ curl -X POST "https://useknockout--api.modal.run/remove-batch-url" \
 
 Both return JSON: `{ "count": N, "format": "png", "results": [{ "success": true, "data_base64": "..." }, ...] }`.
 
+### More presets (v0.3.0)
+
+```bash
+# Sticker — cutout + thick white outline (WhatsApp / iMessage sticker style)
+curl -X POST "https://useknockout--api.modal.run/sticker" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -F "stroke_width=24" -o sticker.png
+
+# Smart crop — tight bounding box around subject
+curl -X POST "https://useknockout--api.modal.run/smart-crop" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -F "padding=32" -o cropped.png
+
+# Studio shot — e-commerce preset (white bg + shadow + centered, 1:1 aspect)
+curl -X POST "https://useknockout--api.modal.run/studio-shot" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -F "aspect=1:1" -F "format=jpg" -o studio.jpg
+
+# Shadow — subject composited onto new bg with a drop shadow
+curl -X POST "https://useknockout--api.modal.run/shadow" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -F "bg_color=#F3F4F6" -o shadow.png
+
+# Compare — before/after side-by-side for marketing/social
+curl -X POST "https://useknockout--api.modal.run/compare" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -o compare.png
+
+# Mask — just the black/white mask, for your own pipeline
+curl -X POST "https://useknockout--api.modal.run/mask" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -o mask.png
+
+# Outline — subject on transparent bg with a thin outline
+curl -X POST "https://useknockout--api.modal.run/outline" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@photo.jpg" -F "outline_color=#000000" -F "outline_width=4" -o outline.png
+```
+
 ### Health check
 
 ```bash
@@ -272,6 +311,90 @@ Same as `/remove-batch` but takes a JSON array of remote URLs.
 ```
 
 **Response** — same JSON shape as `/remove-batch`, with `url` in place of `filename`.
+
+### `POST /mask`
+
+Return just the black/white alpha mask as a grayscale PNG/WebP. Useful for chaining into your own compositing pipeline (Photoshop actions, `ffmpeg` keying, custom workflows).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `format` | string | `png` | `png` or `webp`. |
+
+**Response** — grayscale image (`0` = background, `255` = subject).
+
+### `POST /smart-crop`
+
+Auto-crop to the subject's tight bounding box + padding.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `padding` | int | `24` | Pixels of padding around the bbox. |
+| `transparent` | bool | `true` | `true` → cropped cutout with transparent bg. `false` → cropped region from the original image (bg preserved). |
+| `format` | string | `png` | `png`, `webp`, or `jpg` (when `transparent=false`). |
+
+**Response** — cropped image.
+
+### `POST /shadow`
+
+Composite the subject onto a new background with a configurable drop shadow.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `bg_color` | string | `#FFFFFF` | Hex color for the new background. |
+| `bg_url` | string | — | Optional remote URL. Takes precedence over `bg_color`. |
+| `shadow_color` | string | `#000000` | Hex color for the shadow. |
+| `shadow_offset_x` | int | `8` | Shadow offset in pixels (X). |
+| `shadow_offset_y` | int | `12` | Shadow offset in pixels (Y). |
+| `shadow_blur` | int | `14` | Gaussian blur radius in pixels. |
+| `shadow_opacity` | float | `0.45` | 0.0–1.0. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+### `POST /sticker`
+
+Subject with a thick outline on a transparent background — iMessage / WhatsApp / Telegram sticker style.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `stroke_color` | string | `#FFFFFF` | Outline color. |
+| `stroke_width` | int | `20` | Outline width in pixels (capped at 80). |
+| `format` | string | `png` | `png` or `webp`. |
+
+### `POST /outline`
+
+Subject on transparent background with a thin outline.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `outline_color` | string | `#000000` | Outline color. |
+| `outline_width` | int | `4` | Outline width in pixels (capped at 60). |
+| `format` | string | `png` | `png` or `webp`. |
+
+### `POST /studio-shot`
+
+E-commerce preset: remove background → tight crop → center on solid-color canvas → optional drop shadow → standardized aspect ratio.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `bg_color` | string | `#FFFFFF` | Canvas color. |
+| `aspect` | string | `1:1` | `W:H` format. Examples: `1:1`, `4:5`, `16:9`, `3:2`. |
+| `padding` | int | `48` | Padding around the subject in pixels. |
+| `shadow` | bool | `true` | Include a soft drop shadow. |
+| `format` | string | `jpg` | `png`, `webp`, or `jpg`. |
+
+### `POST /compare`
+
+Before/after side-by-side preview — original on the left, transparent cutout (on a checkerboard) on the right. Great for marketing / social media screenshots.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `format` | string | `png` | `png` or `webp`. |
 
 ### `GET /health`
 

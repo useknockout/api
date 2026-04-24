@@ -72,7 +72,7 @@ with image.imports():
     from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import Response
-    from PIL import Image, UnidentifiedImageError
+    from PIL import Image, ImageDraw, ImageFilter, UnidentifiedImageError
     from pydantic import BaseModel, HttpUrl
     from pymatting import estimate_foreground_ml
     from torchvision import transforms
@@ -211,6 +211,54 @@ class Knockout:
         bg.paste(clean_rgb, (0, 0), mask)
         return bg
 
+    def _bounding_box(self, mask, threshold: int = 10):
+        """Find tight (left, top, right, bottom) bounding box of mask pixels above threshold."""
+        arr = np.asarray(mask.convert("L"))
+        rows = np.any(arr > threshold, axis=1)
+        cols = np.any(arr > threshold, axis=0)
+        if not rows.any() or not cols.any():
+            return None
+        top = int(np.argmax(rows))
+        bottom = int(len(rows) - np.argmax(rows[::-1]))
+        left = int(np.argmax(cols))
+        right = int(len(cols) - np.argmax(cols[::-1]))
+        return (left, top, right, bottom)
+
+    def _dilate_mask(self, mask, radius: int):
+        """Expand mask by `radius` pixels (integer). Used for stroke/outline effects."""
+        if radius <= 0:
+            return mask
+        # Odd-sized window for PIL MaxFilter
+        size = radius * 2 + 1
+        return mask.filter(ImageFilter.MaxFilter(size))
+
+    def _checkerboard(self, size, square: int = 16, a=(230, 230, 230), b=(255, 255, 255)):
+        """Generate a checkerboard RGB image matching `size` = (w, h). Used for /compare preview."""
+        w, h = size
+        img = Image.new("RGB", (w, h), a)
+        draw = ImageDraw.Draw(img)
+        for y in range(0, h, square):
+            for x in range(0, w, square):
+                if ((x // square) + (y // square)) % 2 == 0:
+                    draw.rectangle([x, y, x + square - 1, y + square - 1], fill=b)
+        return img
+
+    def _composite_shadow(self, cutout_rgba, mask, bg, offset=(8, 12), blur=14, opacity=0.45,
+                         shadow_color=(0, 0, 0)):
+        """Add drop shadow under cutout then paste on bg. cutout_rgba is the alpha cutout."""
+        w, h = bg.size
+        shadow_layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        # Shadow = mask, offset, blurred, tinted
+        shadow_mask = mask.convert("L").filter(ImageFilter.GaussianBlur(radius=blur))
+        shadow_alpha_val = int(round(opacity * 255))
+        shadow_rgb = Image.new("RGB", (w, h), shadow_color)
+        shadow_full = Image.merge("RGBA", (*shadow_rgb.split(), shadow_mask.point(lambda p: min(p, shadow_alpha_val))))
+        shadow_layer.alpha_composite(shadow_full, dest=offset)
+        out = bg.convert("RGBA")
+        out.alpha_composite(shadow_layer)
+        out.alpha_composite(cutout_rgba)
+        return out.convert("RGB") if bg.mode == "RGB" else out
+
     _FORMAT_TO_PIL = {"png": "PNG", "webp": "WEBP", "jpg": "JPEG"}
     _FORMAT_TO_MEDIA = {"png": "image/png", "webp": "image/webp", "jpg": "image/jpeg"}
 
@@ -256,13 +304,20 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.2.0",
+                "version": "0.3.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
                     "POST /replace-bg",
                     "POST /remove-batch",
                     "POST /remove-batch-url",
+                    "POST /mask",
+                    "POST /smart-crop",
+                    "POST /shadow",
+                    "POST /sticker",
+                    "POST /outline",
+                    "POST /studio-shot",
+                    "POST /compare",
                     "GET /health",
                 ],
                 "docs": "/docs",
@@ -403,6 +458,289 @@ class Knockout:
                 results.append(item)
 
             return {"count": len(results), "format": fmt, "results": results}
+
+        @web.post("/mask")
+        def mask_endpoint(
+            file: UploadFile = File(...),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """Return just the alpha mask as a grayscale PNG/WebP (0 = bg, 255 = subject)."""
+            self._check_auth(authorization)
+            fmt = self._check_format(format)
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            _, mask = self._get_mask(image_obj)
+            return self._response(mask.convert("L"), fmt)
+
+        @web.post("/smart-crop")
+        def smart_crop_endpoint(
+            file: UploadFile = File(...),
+            padding: int = Form(24),
+            transparent: bool = Form(True),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Auto-crop to the subject's tight bounding box + padding (pixels).
+
+            `transparent=true` (default): return cropped cutout with transparent background.
+            `transparent=false`: return cropped region from the original image (bg preserved).
+            """
+            self._check_auth(authorization)
+            allowed = frozenset({"png", "webp", "jpg"}) if not transparent else frozenset({"png", "webp"})
+            fmt = self._check_format(format, allowed=allowed)
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            bbox = self._bounding_box(mask)
+            if bbox is None:
+                raise HTTPException(400, "No subject detected in image")
+
+            left, top, right, bottom = bbox
+            pad = max(0, int(padding))
+            w, h = rgb.size
+            left = max(0, left - pad)
+            top = max(0, top - pad)
+            right = min(w, right + pad)
+            bottom = min(h, bottom + pad)
+
+            if transparent:
+                clean_rgb = self._clean_foreground(rgb, mask)
+                cutout = clean_rgb.convert("RGBA")
+                cutout.putalpha(mask)
+                cropped = cutout.crop((left, top, right, bottom))
+            else:
+                cropped = rgb.crop((left, top, right, bottom))
+
+            return self._response(cropped, fmt)
+
+        @web.post("/shadow")
+        def shadow_endpoint(
+            file: UploadFile = File(...),
+            bg_color: str = Form("#FFFFFF"),
+            bg_url: Optional[str] = Form(None),
+            shadow_color: str = Form("#000000"),
+            shadow_offset_x: int = Form(8),
+            shadow_offset_y: int = Form(12),
+            shadow_blur: int = Form(14),
+            shadow_opacity: float = Form(0.45),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """Compose subject onto new bg with a configurable drop shadow."""
+            self._check_auth(authorization)
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            if bg_url:
+                try:
+                    r = requests.get(bg_url, timeout=15)
+                    r.raise_for_status()
+                    bg = self._open_image(r.content).convert("RGB").resize(rgb.size, Image.LANCZOS)
+                except requests.RequestException as e:
+                    raise HTTPException(400, f"Could not fetch bg_url: {e}")
+            else:
+                bg = Image.new("RGB", rgb.size, self._parse_color(bg_color))
+
+            clean_rgb = self._clean_foreground(rgb, mask)
+            cutout = clean_rgb.convert("RGBA")
+            cutout.putalpha(mask)
+            composed = self._composite_shadow(
+                cutout,
+                mask,
+                bg,
+                offset=(int(shadow_offset_x), int(shadow_offset_y)),
+                blur=max(0, int(shadow_blur)),
+                opacity=max(0.0, min(1.0, float(shadow_opacity))),
+                shadow_color=self._parse_color(shadow_color),
+            )
+            return self._response(composed, fmt)
+
+        @web.post("/sticker")
+        def sticker_endpoint(
+            file: UploadFile = File(...),
+            stroke_color: str = Form("#FFFFFF"),
+            stroke_width: int = Form(20),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Sticker style — subject with a thick outline on a transparent background.
+            Perfect for WhatsApp/iMessage/Telegram stickers.
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format)
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            width = max(1, min(int(stroke_width), 80))
+            dilated = self._dilate_mask(mask, width)
+
+            stroke_rgb = Image.new("RGB", rgb.size, self._parse_color(stroke_color))
+            stroke_layer = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
+            stroke_layer.paste(stroke_rgb, (0, 0), dilated)
+
+            clean_rgb = self._clean_foreground(rgb, mask)
+            subject = clean_rgb.convert("RGBA")
+            subject.putalpha(mask)
+
+            out = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
+            out.alpha_composite(stroke_layer)
+            out.alpha_composite(subject)
+            return self._response(out, fmt)
+
+        @web.post("/outline")
+        def outline_endpoint(
+            file: UploadFile = File(...),
+            outline_color: str = Form("#000000"),
+            outline_width: int = Form(4),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """Subject on transparent bg with a thin configurable outline."""
+            self._check_auth(authorization)
+            fmt = self._check_format(format)
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            width = max(1, min(int(outline_width), 60))
+            dilated = self._dilate_mask(mask, width)
+            outline_only = Image.new("L", rgb.size, 0)
+            # Outline = dilated mask minus original mask
+            dilated_arr = np.asarray(dilated.convert("L"), dtype=np.int16)
+            mask_arr = np.asarray(mask.convert("L"), dtype=np.int16)
+            ring_arr = np.clip(dilated_arr - mask_arr, 0, 255).astype(np.uint8)
+            outline_only = Image.fromarray(ring_arr, mode="L")
+
+            ring_rgb = Image.new("RGB", rgb.size, self._parse_color(outline_color))
+            ring_layer = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
+            ring_layer.paste(ring_rgb, (0, 0), outline_only)
+
+            clean_rgb = self._clean_foreground(rgb, mask)
+            subject = clean_rgb.convert("RGBA")
+            subject.putalpha(mask)
+
+            out = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
+            out.alpha_composite(ring_layer)
+            out.alpha_composite(subject)
+            return self._response(out, fmt)
+
+        @web.post("/studio-shot")
+        def studio_shot_endpoint(
+            file: UploadFile = File(...),
+            bg_color: str = Form("#FFFFFF"),
+            aspect: str = Form("1:1"),
+            padding: int = Form(48),
+            shadow: bool = Form(True),
+            format: str = Form("jpg"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            E-commerce preset — cutout → tight crop → centered on bg with shadow → standard aspect.
+
+            `aspect`: "1:1", "4:5", "16:9", "3:2", or "W:H" (ints). Default 1:1.
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            try:
+                aw_str, ah_str = aspect.split(":")
+                aw, ah = int(aw_str), int(ah_str)
+                if aw <= 0 or ah <= 0:
+                    raise ValueError()
+            except Exception:
+                raise HTTPException(400, "aspect must be in 'W:H' format, e.g. '1:1' or '4:5'")
+
+            bbox = self._bounding_box(mask)
+            if bbox is None:
+                raise HTTPException(400, "No subject detected in image")
+            left, top, right, bottom = bbox
+
+            clean_rgb = self._clean_foreground(rgb, mask)
+            cutout = clean_rgb.convert("RGBA")
+            cutout.putalpha(mask)
+
+            subject_w = right - left
+            subject_h = bottom - top
+            pad = max(0, int(padding))
+
+            # Target canvas: subject + 2*padding, padded out to aspect ratio
+            base_w = subject_w + pad * 2
+            base_h = subject_h + pad * 2
+            target_w = max(base_w, int(round(base_h * aw / ah)))
+            target_h = max(base_h, int(round(target_w * ah / aw)))
+            # Re-check W after H adjustment (keeps ratio exact)
+            if round(target_w * ah / aw) != target_h:
+                target_w = int(round(target_h * aw / ah))
+
+            bg_rgb = Image.new("RGB", (target_w, target_h), self._parse_color(bg_color))
+
+            subject_cut = cutout.crop((left, top, right, bottom))
+            subject_mask = mask.crop((left, top, right, bottom))
+
+            paste_x = (target_w - subject_w) // 2
+            paste_y = (target_h - subject_h) // 2
+
+            if shadow:
+                full_mask_for_shadow = Image.new("L", (target_w, target_h), 0)
+                full_mask_for_shadow.paste(subject_mask, (paste_x, paste_y))
+                full_cutout = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+                full_cutout.paste(subject_cut, (paste_x, paste_y))
+                composed = self._composite_shadow(
+                    full_cutout,
+                    full_mask_for_shadow,
+                    bg_rgb,
+                    offset=(8, 12),
+                    blur=14,
+                    opacity=0.35,
+                    shadow_color=(0, 0, 0),
+                )
+            else:
+                composed = bg_rgb.convert("RGBA")
+                composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
+                composed = composed.convert("RGB")
+
+            return self._response(composed, fmt)
+
+        @web.post("/compare")
+        def compare_endpoint(
+            file: UploadFile = File(...),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Before/after preview — original on the left, cutout over a checkerboard on the right.
+            Perfect for marketing screenshots and social media.
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format)
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            clean_rgb = self._clean_foreground(rgb, mask)
+            cutout = clean_rgb.convert("RGBA")
+            cutout.putalpha(mask)
+
+            w, h = rgb.size
+            canvas = Image.new("RGB", (w * 2, h), (255, 255, 255))
+            canvas.paste(rgb, (0, 0))
+            checker = self._checkerboard((w, h))
+            canvas.paste(checker, (w, 0))
+            canvas_rgba = canvas.convert("RGBA")
+            canvas_rgba.alpha_composite(cutout, dest=(w, 0))
+            canvas = canvas_rgba.convert("RGB")
+
+            return self._response(canvas, fmt)
 
         @web.post("/remove-batch-url")
         def remove_batch_url_endpoint(
