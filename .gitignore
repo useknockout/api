@@ -59,6 +59,10 @@ batch-*.jpg
 batch-result.json
 admin-test.*
 public-test.*
+demo-*.png
+demo-*.jpg
+demo-*.webp
+demo.jpg
 
 # Local scratch folder — all testing artifacts go here
 .local/
