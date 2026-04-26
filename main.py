@@ -154,7 +154,19 @@ class Knockout:
             preds = self.model(tensor)[-1].sigmoid().cpu()
         pred = preds[0].squeeze().float()
         mask = self.to_pil(pred).resize(rgb.size)
+        self._bump_counter()
         return rgb, mask
+
+    def _bump_counter(self) -> None:
+        """Increment public processed-image counter. Never raises."""
+        try:
+            from datetime import datetime
+            stats = modal.Dict.from_name("knockout-stats", create_if_missing=True)
+            today = datetime.utcnow().strftime("%Y-%m-%d")
+            stats["total"] = int(stats.get("total", 0)) + 1
+            stats[f"day:{today}"] = int(stats.get(f"day:{today}", 0)) + 1
+        except Exception:
+            pass  # counter is best-effort; never block processing
 
     def _clean_foreground(self, rgb: "Image.Image", mask: "Image.Image") -> "Image.Image":
         """
@@ -282,7 +294,7 @@ class Knockout:
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal API.",
-            version="0.1.0",
+            version="0.4.0",
         )
 
         web.add_middleware(
@@ -300,11 +312,16 @@ class Knockout:
             urls: List[HttpUrl]
             format: str = "png"
 
+        class EstimateBody(BaseModel):
+            endpoint: str
+            width: int
+            height: int
+
         @web.get("/")
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.3.0",
+                "version": "0.4.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -318,6 +335,10 @@ class Knockout:
                     "POST /outline",
                     "POST /studio-shot",
                     "POST /compare",
+                    "POST /headshot",
+                    "POST /preview",
+                    "POST /estimate",
+                    "GET /stats",
                     "GET /health",
                 ],
                 "docs": "/docs",
@@ -785,5 +806,198 @@ class Knockout:
                 results.append(item)
 
             return {"count": len(results), "format": fmt, "results": results}
+
+        @web.get("/stats")
+        def stats_endpoint():
+            """
+            Public usage counter. Used for landing-page social proof.
+
+            Returns total images processed all-time, today, and a 7-day rolling
+            breakdown. Eventually consistent across containers (best-effort).
+            """
+            from datetime import datetime, timedelta
+            try:
+                stats = modal.Dict.from_name("knockout-stats", create_if_missing=True)
+                today = datetime.utcnow().strftime("%Y-%m-%d")
+                last_7 = []
+                for i in range(7):
+                    d = (datetime.utcnow() - timedelta(days=i)).strftime("%Y-%m-%d")
+                    last_7.append({"date": d, "count": int(stats.get(f"day:{d}", 0))})
+                return {
+                    "total_processed": int(stats.get("total", 0)),
+                    "today": int(stats.get(f"day:{today}", 0)),
+                    "last_7_days": last_7,
+                }
+            except Exception as e:
+                return {
+                    "error": "stats unavailable",
+                    "detail": str(e),
+                    "total_processed": 0,
+                    "today": 0,
+                    "last_7_days": [],
+                }
+
+        @web.post("/preview")
+        def preview_endpoint(
+            file: UploadFile = File(...),
+            max_dim: int = Form(512),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Fast low-res preview cutout for UX progress indicators.
+
+            Downscales the input to `max_dim` (64-1024) on the long edge and
+            skips the pymatting refinement pass. Returns a transparent PNG/WebP.
+            ~80ms warm vs ~200ms for /remove.
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format)
+            data = file.file.read()
+            image_obj = self._open_image(data)
+
+            rgb_full = image_obj.convert("RGB")
+            w, h = rgb_full.size
+            md = max(64, min(int(max_dim), 1024))
+            scale = min(1.0, md / max(w, h))
+            if scale < 1.0:
+                rgb_small = rgb_full.resize((int(w * scale), int(h * scale)), Image.LANCZOS)
+            else:
+                rgb_small = rgb_full
+
+            tensor = self.transform(rgb_small).unsqueeze(0).to("cuda").half()
+            with torch.no_grad():
+                preds = self.model(tensor)[-1].sigmoid().cpu()
+            pred = preds[0].squeeze().float()
+            mask = self.to_pil(pred).resize(rgb_small.size)
+            self._bump_counter()
+
+            result = rgb_small.convert("RGBA")
+            result.putalpha(mask)
+            return self._response(result, fmt)
+
+        @web.post("/estimate")
+        def estimate_endpoint(body: EstimateBody):
+            """
+            Predict latency + cost for a given endpoint and image size.
+
+            No GPU work — pure lookup against measured baselines. Intended
+            for client-side progress UI and pre-flight billing checks.
+            """
+            LATENCY_MS_BASE = {
+                "remove": 200, "remove-url": 250, "replace-bg": 220,
+                "mask": 150, "smart-crop": 180, "shadow": 230,
+                "sticker": 220, "outline": 220, "studio-shot": 280,
+                "compare": 240, "preview": 80, "headshot": 280,
+                "remove-batch": 200, "remove-batch-url": 250,
+            }
+            ep = body.endpoint.strip().lstrip("/")
+            if ep not in LATENCY_MS_BASE:
+                raise HTTPException(400, f"unknown endpoint: {ep!r}")
+
+            w = max(1, int(body.width))
+            h = max(1, int(body.height))
+            px = w * h
+            base_ms = LATENCY_MS_BASE[ep]
+            # +50% per million pixels above 1MP, capped at +400%
+            extra_factor = min(4.0, max(0.0, (px - 1_000_000) / 1_000_000) * 0.5)
+            est_ms = int(round(base_ms * (1.0 + extra_factor)))
+
+            return {
+                "endpoint": ep,
+                "image_pixels": px,
+                "est_latency_ms_warm": est_ms,
+                "est_latency_ms_cold": est_ms + 8000,  # ~8s cold start on L4
+                "est_cost_usd": 0.005,
+                "free_during_beta": True,
+                "note": "warm = container already running; cold = first request after scaledown",
+            }
+
+        @web.post("/headshot")
+        def headshot_endpoint(
+            file: UploadFile = File(...),
+            bg_color: str = Form("#FFFFFF"),
+            bg_blur: bool = Form(False),
+            blur_radius: int = Form(20),
+            aspect: str = Form("4:5"),
+            padding: int = Form(64),
+            head_top_ratio: float = Form(0.18),
+            format: str = Form("jpg"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            LinkedIn-ready headshot preset.
+
+            Removes background, crops to subject + padding, centers on a portrait
+            canvas (default 4:5), and either fills with a solid color or a blurred
+            copy of the original (set `bg_blur=true`). `head_top_ratio` controls
+            how much empty space sits above the subject (default 18% of canvas).
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            try:
+                aw_str, ah_str = aspect.split(":")
+                aw, ah = int(aw_str), int(ah_str)
+                if aw <= 0 or ah <= 0:
+                    raise ValueError()
+            except Exception:
+                raise HTTPException(400, "aspect must be in 'W:H' format, e.g. '4:5'")
+
+            bbox = self._bounding_box(mask)
+            if bbox is None:
+                raise HTTPException(400, "No subject detected in image")
+            left, top, right, bottom = bbox
+
+            clean_rgb = self._clean_foreground(rgb, mask)
+            cutout = clean_rgb.convert("RGBA")
+            cutout.putalpha(mask)
+
+            subject_w = right - left
+            subject_h = bottom - top
+            pad = max(0, int(padding))
+
+            base_w = subject_w + pad * 2
+            base_h = subject_h + pad * 2
+            target_w = max(base_w, int(round(base_h * aw / ah)))
+            target_h = max(base_h, int(round(target_w * ah / aw)))
+            if round(target_w * ah / aw) != target_h:
+                target_w = int(round(target_h * aw / ah))
+
+            if bg_blur:
+                blur_r = max(1, min(int(blur_radius), 80))
+                bg_full = rgb.copy().filter(ImageFilter.GaussianBlur(radius=blur_r))
+                bg_canvas = bg_full.resize((target_w, target_h), Image.LANCZOS)
+            else:
+                bg_canvas = Image.new("RGB", (target_w, target_h), self._parse_color(bg_color))
+
+            subject_cut = cutout.crop((left, top, right, bottom))
+            subject_mask = mask.crop((left, top, right, bottom))
+
+            paste_x = (target_w - subject_w) // 2
+            top_ratio = max(0.0, min(0.5, float(head_top_ratio)))
+            paste_y = int(round(target_h * top_ratio))
+            # clamp so subject fits
+            paste_y = min(paste_y, target_h - subject_h - pad)
+            paste_y = max(pad, paste_y)
+
+            full_mask = Image.new("L", (target_w, target_h), 0)
+            full_mask.paste(subject_mask, (paste_x, paste_y))
+            full_cutout = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+            full_cutout.paste(subject_cut, (paste_x, paste_y))
+
+            composed = self._composite_shadow(
+                full_cutout,
+                full_mask,
+                bg_canvas,
+                offset=(6, 10),
+                blur=18,
+                opacity=0.30,
+                shadow_color=(0, 0, 0),
+            )
+            return self._response(composed, fmt)
 
         return web
