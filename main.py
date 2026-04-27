@@ -32,13 +32,58 @@ MODEL_INPUT_SIZE = (1024, 1024)
 MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
 
 
+UPSCALE_WEIGHTS_DIR = "/root/weights"
+REALESRGAN_URL = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+)
+GFPGAN_URL = (
+    "https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth"
+)
+FACEXLIB_DETECTION_URL = (
+    "https://github.com/xinntao/facexlib/releases/download/v0.1.0/detection_Resnet50_Final.pth"
+)
+FACEXLIB_PARSING_URL = (
+    "https://github.com/xinntao/facexlib/releases/download/v0.2.2/parsing_parsenet.pth"
+)
+
+
 def _download_model() -> None:
-    """Bake weights into the image at build time so cold starts are fast."""
+    """Bake all model weights into the image at build time so cold starts are fast."""
+    import os
+    import urllib.request
+
     from transformers import AutoModelForImageSegmentation
 
-    AutoModelForImageSegmentation.from_pretrained(
-        MODEL_REPO, trust_remote_code=True
-    )
+    AutoModelForImageSegmentation.from_pretrained(MODEL_REPO, trust_remote_code=True)
+
+    os.makedirs(UPSCALE_WEIGHTS_DIR, exist_ok=True)
+
+    # Real-ESRGAN + GFPGAN main weights — explicit paths used at load time.
+    direct_downloads = {
+        "RealESRGAN_x4plus.pth": REALESRGAN_URL,
+        "GFPGANv1.4.pth": GFPGAN_URL,
+    }
+    for name, url in direct_downloads.items():
+        dest = os.path.join(UPSCALE_WEIGHTS_DIR, name)
+        if not os.path.exists(dest):
+            print(f"Downloading {name}...")
+            urllib.request.urlretrieve(url, dest)
+
+    # facexlib auto-downloads detection + parsing weights into gfpgan/weights/.
+    # Pre-bake them so the first /face-restore request doesn't pay the network cost.
+    import gfpgan as _gfpgan_mod
+
+    gfpgan_weights_dir = os.path.join(os.path.dirname(_gfpgan_mod.__file__), "weights")
+    os.makedirs(gfpgan_weights_dir, exist_ok=True)
+    facexlib_downloads = {
+        "detection_Resnet50_Final.pth": FACEXLIB_DETECTION_URL,
+        "parsing_parsenet.pth": FACEXLIB_PARSING_URL,
+    }
+    for name, url in facexlib_downloads.items():
+        dest = os.path.join(gfpgan_weights_dir, name)
+        if not os.path.exists(dest):
+            print(f"Downloading {name} → gfpgan/weights/...")
+            urllib.request.urlretrieve(url, dest)
 
 
 image = (
@@ -59,6 +104,27 @@ image = (
         "pydantic==2.9.2",
         "numpy==1.26.4",
         "pymatting==1.1.12",
+        "opencv-python-headless==4.10.0.84",
+    )
+    .pip_install(
+        "basicsr==1.4.2",
+        "facexlib==0.3.0",
+        "realesrgan==0.3.0",
+        "gfpgan==1.3.8",
+    )
+    # basicsr install bumps numpy to 2.x — pin back to 1.26.4 to keep pymatting + PIL stable.
+    .pip_install("numpy==1.26.4")
+    # basicsr 1.4.2 + facexlib import `torchvision.transforms.functional_tensor`,
+    # removed in torchvision 0.17+. Patch every file in site-packages that
+    # references it. Uses grep to find files (no Python import — would crash).
+    # Then nuke __pycache__ so stale .pyc bytecode doesn't shadow the new .py.
+    .run_commands(
+        "grep -rl 'torchvision.transforms.functional_tensor' "
+        "/usr/local/lib/python3.11/site-packages/ "
+        "| xargs --no-run-if-empty "
+        "sed -i 's/torchvision.transforms.functional_tensor/torchvision.transforms.functional/g'",
+        "find /usr/local/lib/python3.11/site-packages/ -type d -name __pycache__ "
+        "-exec rm -rf {} + 2>/dev/null; true"
     )
     .run_function(_download_model)
 )
@@ -69,12 +135,15 @@ with image.imports():
     import numpy as np
     import requests
     import torch
+    from basicsr.archs.rrdbnet_arch import RRDBNet
     from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import Response
+    from gfpgan import GFPGANer
     from PIL import Image, ImageDraw, ImageFilter, UnidentifiedImageError
     from pydantic import BaseModel, HttpUrl
     from pymatting import estimate_foreground_ml
+    from realesrgan import RealESRGANer
     from torchvision import transforms
     from transformers import AutoModelForImageSegmentation
 
@@ -104,6 +173,31 @@ class Knockout:
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
         ])
         self.to_pil = transforms.ToPILImage()
+
+        # Real-ESRGAN x4 upscaler. Tile inference keeps VRAM bounded for big inputs.
+        rrdb = RRDBNet(
+            num_in_ch=3, num_out_ch=3, num_feat=64,
+            num_block=23, num_grow_ch=32, scale=4,
+        )
+        self.upscaler = RealESRGANer(
+            scale=4,
+            model_path=f"{UPSCALE_WEIGHTS_DIR}/RealESRGAN_x4plus.pth",
+            model=rrdb,
+            tile=512,
+            tile_pad=10,
+            pre_pad=0,
+            half=True,
+            gpu_id=0,
+        )
+
+        # GFPGAN portrait restorer. Uses Real-ESRGAN as the background upsampler.
+        self.face_restorer = GFPGANer(
+            model_path=f"{UPSCALE_WEIGHTS_DIR}/GFPGANv1.4.pth",
+            upscale=2,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=self.upscaler,
+        )
 
     def _check_auth(self, authorization: Optional[str]) -> None:
         raw = os.environ.get("API_TOKEN", "").strip()
@@ -167,6 +261,15 @@ class Knockout:
             stats[f"day:{today}"] = int(stats.get(f"day:{today}", 0)) + 1
         except Exception:
             pass  # counter is best-effort; never block processing
+
+    def _pil_to_bgr(self, image_obj):
+        """PIL Image (any mode) → contiguous BGR uint8 ndarray expected by Real-ESRGAN/GFPGAN."""
+        rgb = np.array(image_obj.convert("RGB"))
+        return np.ascontiguousarray(rgb[:, :, ::-1])
+
+    def _bgr_to_pil(self, bgr_arr):
+        """BGR uint8 ndarray → RGB PIL Image."""
+        return Image.fromarray(bgr_arr[:, :, ::-1])
 
     def _clean_foreground(self, rgb: "Image.Image", mask: "Image.Image") -> "Image.Image":
         """
@@ -293,8 +396,8 @@ class Knockout:
     def fastapi_app(self):
         web = FastAPI(
             title="useknockout",
-            description="State-of-the-art background removal API.",
-            version="0.4.0",
+            description="State-of-the-art background removal + upscaling API.",
+            version="0.5.0",
         )
 
         web.add_middleware(
@@ -321,7 +424,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.4.0",
+                "version": "0.5.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -337,6 +440,8 @@ class Knockout:
                     "POST /compare",
                     "POST /headshot",
                     "POST /preview",
+                    "POST /upscale",
+                    "POST /face-restore",
                     "POST /estimate",
                     "GET /stats",
                     "GET /health",
@@ -837,6 +942,84 @@ class Knockout:
                     "last_7_days": [],
                 }
 
+        @web.post("/upscale")
+        def upscale_endpoint(
+            file: UploadFile = File(...),
+            scale: int = Form(4),
+            face_enhance: bool = Form(False),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Real-ESRGAN x4 super-resolution.
+
+            `scale` 2 or 4. `face_enhance=true` routes through GFPGAN to fix facial
+            detail (slower; use for portraits). Tile inference handles arbitrarily
+            large inputs without OOM.
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            if scale not in (2, 4):
+                raise HTTPException(400, "scale must be 2 or 4")
+
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            bgr = self._pil_to_bgr(image_obj)
+
+            try:
+                if face_enhance:
+                    _, _, output_bgr = self.face_restorer.enhance(
+                        bgr,
+                        has_aligned=False,
+                        only_center_face=False,
+                        paste_back=True,
+                    )
+                else:
+                    output_bgr, _ = self.upscaler.enhance(bgr, outscale=scale)
+            except RuntimeError as e:
+                raise HTTPException(500, f"upscale failed: {e}")
+
+            if output_bgr is None:
+                raise HTTPException(500, "upscale produced no output")
+
+            self._bump_counter()
+            return self._response(self._bgr_to_pil(output_bgr), fmt)
+
+        @web.post("/face-restore")
+        def face_restore_endpoint(
+            file: UploadFile = File(...),
+            only_center_face: bool = Form(False),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            GFPGAN v1.4 portrait restoration. Fixes blurry / damaged / low-res faces.
+            Background is upscaled 2x by Real-ESRGAN. Set `only_center_face=true` to
+            restore only the most prominent face (faster).
+            """
+            self._check_auth(authorization)
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            bgr = self._pil_to_bgr(image_obj)
+
+            try:
+                _, _, output_bgr = self.face_restorer.enhance(
+                    bgr,
+                    has_aligned=False,
+                    only_center_face=only_center_face,
+                    paste_back=True,
+                )
+            except RuntimeError as e:
+                raise HTTPException(500, f"face-restore failed: {e}")
+
+            if output_bgr is None:
+                raise HTTPException(500, "face-restore produced no output")
+
+            self._bump_counter()
+            return self._response(self._bgr_to_pil(output_bgr), fmt)
+
         @web.post("/preview")
         def preview_endpoint(
             file: UploadFile = File(...),
@@ -890,6 +1073,7 @@ class Knockout:
                 "sticker": 220, "outline": 220, "studio-shot": 280,
                 "compare": 240, "preview": 80, "headshot": 280,
                 "remove-batch": 200, "remove-batch-url": 250,
+                "upscale": 1500, "face-restore": 2200,
             }
             ep = body.endpoint.strip().lstrip("/")
             if ep not in LATENCY_MS_BASE:
