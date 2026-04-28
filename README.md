@@ -396,6 +396,86 @@ Before/after side-by-side preview — original on the left, transparent cutout (
 | `file` | binary | required | Foreground image. |
 | `format` | string | `png` | `png` or `webp`. |
 
+### `POST /headshot` (v0.4.0)
+
+Studio-quality professional headshot — background removed, neutral studio backdrop, optional soft shadow, smart crop to bust framing. One call.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source portrait. |
+| `bg_color` | string | `#f5f5f5` | Studio backdrop hex. |
+| `add_shadow` | bool | `true` | Soft drop shadow. |
+| `crop` | string | `bust` | `bust`, `head`, or `full`. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+### `POST /preview` (v0.4.0)
+
+Cheap, fast low-res preview — 512px max, watermark optional. Use for thumbnail UI before user pays for full-res. Returns in ~1.5s.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source image. |
+| `max_size` | int | `512` | Max edge length. |
+| `watermark` | bool | `false` | Add `useknockout` watermark. |
+
+### `POST /estimate` (v0.4.0)
+
+Returns expected processing time + output size **without running the model**. Use to show users "this'll take ~3s, ~1.2 MB" before they hit submit.
+
+```bash
+curl -X POST "https://useknockout--api.modal.run/estimate" \
+  -H "Content-Type: application/json" \
+  -d '{"width": 2048, "height": 1536, "endpoint": "remove"}'
+```
+
+Response: `{"estimated_seconds": 2.4, "estimated_output_kb": 1180, "warm": true}`
+
+### `GET /stats` (v0.4.0)
+
+Public stats — total images processed, last-24h count, last-7d trend. Powered by Modal Dict cross-container counter. No auth required.
+
+```bash
+curl https://useknockout--api.modal.run/stats
+```
+
+### `POST /upscale` (v0.5.0)
+
+**Real-ESRGAN x2/x4 super-resolution.** Takes blurry/small images, outputs 2x or 4x larger with AI-restored detail. Not pixel stretching — invents plausible texture. Tile-based so handles big inputs without OOM.
+
+```bash
+curl -X POST "https://useknockout--api.modal.run/upscale" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@small.jpg" \
+  -F "scale=4" \
+  -o upscaled.png
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source image. |
+| `scale` | int | `4` | `2` or `4`. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+**Use cases:** restore old photos, enlarge product shots, fix low-res screenshots, upscale AI-generated thumbnails.
+
+### `POST /face-restore` (v0.5.0)
+
+**GFPGAN v1.4 face restoration.** Detects faces, restores blurred/compressed/damaged ones while preserving identity. Background also upscaled via Real-ESRGAN. Multi-face safe.
+
+```bash
+curl -X POST "https://useknockout--api.modal.run/face-restore" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@blurry-portrait.jpg" \
+  -o restored.png
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source image with one or more faces. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+**Use cases:** old family photos, Zoom screenshots, dating app pics, restore CCTV stills.
+
 ### `GET /health`
 
 Returns `{"status":"ok","model":"ZhengPeng7/BiRefNet"}`. No auth required.
