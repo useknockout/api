@@ -142,7 +142,7 @@ with image.imports():
     from gfpgan import GFPGANer
     from PIL import Image, ImageDraw, ImageFilter, UnidentifiedImageError
     from pydantic import BaseModel, HttpUrl
-    from pymatting import estimate_foreground_ml
+    from pymatting import estimate_foreground_cf, estimate_foreground_ml
     from realesrgan import RealESRGANer
     from torchvision import transforms
     from transformers import AutoModelForImageSegmentation
@@ -190,8 +190,18 @@ class Knockout:
             gpu_id=0,
         )
 
-        # GFPGAN portrait restorer. Uses Real-ESRGAN as the background upsampler.
+        # GFPGAN portrait restorer — two variants:
+        #   face_restorer       → original bg preserved (no Real-ESRGAN bg pass)
+        #                         avoids skin-tone bleed into bg around face edges
+        #   face_restorer_full  → bg also upscaled via Real-ESRGAN (legacy v0.5.0 behavior)
         self.face_restorer = GFPGANer(
+            model_path=f"{UPSCALE_WEIGHTS_DIR}/GFPGANv1.4.pth",
+            upscale=2,
+            arch="clean",
+            channel_multiplier=2,
+            bg_upsampler=None,
+        )
+        self.face_restorer_full = GFPGANer(
             model_path=f"{UPSCALE_WEIGHTS_DIR}/GFPGANv1.4.pth",
             upscale=2,
             arch="clean",
@@ -271,19 +281,19 @@ class Knockout:
         """BGR uint8 ndarray → RGB PIL Image."""
         return Image.fromarray(bgr_arr[:, :, ::-1])
 
-    def _clean_foreground(self, rgb: "Image.Image", mask: "Image.Image") -> "Image.Image":
+    def _clean_foreground(self, rgb: "Image.Image", mask: "Image.Image", *, fast: bool = False) -> "Image.Image":
         """
         Estimate pure foreground RGB at mask edges using closed-form matting.
         Eliminates color spill / halo from the original background.
 
         Skipped when FOREGROUND_REFINE=false. Downscaled internally to keep
-        compute bounded (pymatting is O(N) but heavy at 4K+).
+        compute bounded (closed-form is O(N²) but solver is sparse).
         """
         if os.environ.get("FOREGROUND_REFINE", "true").strip().lower() in {"false", "0", "no", "off"}:
             return rgb
 
         w, h = rgb.size
-        max_dim = 1024  # matting scales ~linearly; cap work to keep latency low
+        max_dim = 1024 if fast else 2048
         scale = min(1.0, max_dim / max(w, h))
 
         if scale < 1.0:
@@ -298,7 +308,8 @@ class Knockout:
         alpha_arr = np.asarray(mask_small.convert("L"), dtype=np.float32) / 255.0
 
         try:
-            clean = estimate_foreground_ml(fg_arr, alpha_arr)
+            estimator = estimate_foreground_ml if fast else estimate_foreground_cf
+            clean = estimator(fg_arr, alpha_arr)
             clean_u8 = np.clip(clean * 255.0, 0.0, 255.0).astype(np.uint8)
             clean_img = Image.fromarray(clean_u8, mode="RGB")
             if scale < 1.0:
@@ -397,7 +408,7 @@ class Knockout:
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling API.",
-            version="0.5.0",
+            version="0.5.1",
         )
 
         web.add_middleware(
@@ -424,7 +435,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.5.0",
+                "version": "0.5.1",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -989,13 +1000,20 @@ class Knockout:
         def face_restore_endpoint(
             file: UploadFile = File(...),
             only_center_face: bool = Form(False),
+            bg_enhance: bool = Form(False),
             format: str = Form("png"),
             authorization: Optional[str] = Header(default=None),
         ):
             """
             GFPGAN v1.4 portrait restoration. Fixes blurry / damaged / low-res faces.
-            Background is upscaled 2x by Real-ESRGAN. Set `only_center_face=true` to
-            restore only the most prominent face (faster).
+
+            By default the background is preserved as-is — avoids skin-tone bleed
+            into bg around face edges (common on warm-toned bgs).
+
+            Set `bg_enhance=true` to also upscale the background 2x via Real-ESRGAN
+            (recommended only when bg has cool/neutral tones).
+
+            Set `only_center_face=true` to restore only the most prominent face (faster).
             """
             self._check_auth(authorization)
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
@@ -1004,8 +1022,9 @@ class Knockout:
             image_obj = self._open_image(data)
             bgr = self._pil_to_bgr(image_obj)
 
+            restorer = self.face_restorer_full if bg_enhance else self.face_restorer
             try:
-                _, _, output_bgr = self.face_restorer.enhance(
+                _, _, output_bgr = restorer.enhance(
                     bgr,
                     has_aligned=False,
                     only_center_face=only_center_face,
