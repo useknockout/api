@@ -438,15 +438,26 @@ Public stats — total images processed, last-24h count, last-7d trend. Powered 
 curl https://useknockout--api.modal.run/stats
 ```
 
-### `POST /upscale` (v0.5.0)
+### `POST /upscale` (v0.6.0)
 
-**Real-ESRGAN x2/x4 super-resolution.** Takes blurry/small images, outputs 2x or 4x larger with AI-restored detail. Not pixel stretching — invents plausible texture. Tile-based so handles big inputs without OOM.
+**Swin2SR / Real-ESRGAN x2/x4 super-resolution.** Takes blurry/small images, outputs 2x or 4x larger with AI-restored detail. Not pixel stretching — invents plausible texture.
+
+**v0.6.0** — default backend switched to **Swin2SR** (SwinV2 Transformer, successor to SwinIR). Sharper detail and more natural texture on real photos compared to Real-ESRGAN, which tends to produce a painted / plastic look on faces. Real-ESRGAN remains available via `model=realesrgan` and is still the better choice for anime / illustrations.
 
 ```bash
+# default — Swin2SR (best for real photos)
 curl -X POST "https://useknockout--api.modal.run/upscale" \
   -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
   -F "file=@small.jpg" \
   -F "scale=4" \
+  -o upscaled.png
+
+# legacy — Real-ESRGAN (best for anime / illustrations)
+curl -X POST "https://useknockout--api.modal.run/upscale" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@art.png" \
+  -F "scale=4" \
+  -F "model=realesrgan" \
   -o upscaled.png
 ```
 
@@ -454,6 +465,8 @@ curl -X POST "https://useknockout--api.modal.run/upscale" \
 |---|---|---|---|
 | `file` | binary | required | Source image. |
 | `scale` | int | `4` | `2` or `4`. |
+| `model` | string | `swin2sr` | `swin2sr` (default) or `realesrgan` (legacy). |
+| `face_enhance` | bool | `false` | Route through GFPGAN for facial detail. Implies Real-ESRGAN backend. |
 | `format` | string | `png` | `png`, `webp`, or `jpg`. |
 
 **Use cases:** restore old photos, enlarge product shots, fix low-res screenshots, upscale AI-generated thumbnails.

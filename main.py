@@ -31,6 +31,12 @@ MODEL_REPO = "ZhengPeng7/BiRefNet"
 MODEL_INPUT_SIZE = (1024, 1024)
 MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
 
+# Swin2SR — SwinV2 Transformer super-res (successor to SwinIR). Apache-2.0.
+# Better than Real-ESRGAN on real photos: preserves skin/hair texture instead
+# of the painted/plastic look Real-ESRGAN produces on faces.
+SWIN2SR_X4_REPO = "caidas/swin2SR-realworld-sr-x4-64-bsrgan-psnr"
+SWIN2SR_X2_REPO = "caidas/swin2SR-classical-sr-x2-64"
+
 
 UPSCALE_WEIGHTS_DIR = "/root/weights"
 REALESRGAN_URL = (
@@ -52,9 +58,18 @@ def _download_model() -> None:
     import os
     import urllib.request
 
-    from transformers import AutoModelForImageSegmentation
+    from transformers import (
+        AutoImageProcessor,
+        AutoModelForImageSegmentation,
+        Swin2SRForImageSuperResolution,
+    )
 
     AutoModelForImageSegmentation.from_pretrained(MODEL_REPO, trust_remote_code=True)
+
+    # Bake Swin2SR weights into image so cold starts skip the HF download.
+    for repo in (SWIN2SR_X4_REPO, SWIN2SR_X2_REPO):
+        Swin2SRForImageSuperResolution.from_pretrained(repo)
+        AutoImageProcessor.from_pretrained(repo)
 
     os.makedirs(UPSCALE_WEIGHTS_DIR, exist_ok=True)
 
@@ -82,7 +97,7 @@ def _download_model() -> None:
     for name, url in facexlib_downloads.items():
         dest = os.path.join(gfpgan_weights_dir, name)
         if not os.path.exists(dest):
-            print(f"Downloading {name} → gfpgan/weights/...")
+            print(f"Downloading {name} -> gfpgan/weights/...")
             urllib.request.urlretrieve(url, dest)
 
 
@@ -145,7 +160,11 @@ with image.imports():
     from pymatting import estimate_foreground_cf, estimate_foreground_ml
     from realesrgan import RealESRGANer
     from torchvision import transforms
-    from transformers import AutoModelForImageSegmentation
+    from transformers import (
+        AutoImageProcessor,
+        AutoModelForImageSegmentation,
+        Swin2SRForImageSuperResolution,
+    )
 
 app = modal.App(APP_NAME, image=image)
 
@@ -209,6 +228,18 @@ class Knockout:
             bg_upsampler=self.upscaler,
         )
 
+        # Swin2SR — default upscaler. Better photo quality than Real-ESRGAN
+        # (which is trained heavily on synthetic/anime and produces a painted
+        # look on real photos). x4 = real-world BSRGAN-PSNR weights, x2 = classical.
+        self.swin2sr_x4 = Swin2SRForImageSuperResolution.from_pretrained(
+            SWIN2SR_X4_REPO
+        ).to("cuda").eval().half()
+        self.swin2sr_x2 = Swin2SRForImageSuperResolution.from_pretrained(
+            SWIN2SR_X2_REPO
+        ).to("cuda").eval().half()
+        self.swin2sr_proc_x4 = AutoImageProcessor.from_pretrained(SWIN2SR_X4_REPO)
+        self.swin2sr_proc_x2 = AutoImageProcessor.from_pretrained(SWIN2SR_X2_REPO)
+
     def _check_auth(self, authorization: Optional[str]) -> None:
         raw = os.environ.get("API_TOKEN", "").strip()
         if not raw:
@@ -271,6 +302,85 @@ class Knockout:
             stats[f"day:{today}"] = int(stats.get(f"day:{today}", 0)) + 1
         except Exception:
             pass  # counter is best-effort; never block processing
+
+    def _swin2sr_upscale(self, image_obj, scale: int):
+        """
+        Swin2SR super-resolution with tiled inference + linear-blend overlap.
+
+        Swin2SR has no built-in tiling, so we slice the input into overlapping
+        tiles, run each through the model, and blend overlap regions to hide
+        seams. Tile size = 256 (32x window_size=8), overlap = 32 px.
+
+        scale: 2 or 4. Picks the matching pretrained Swin2SR variant.
+        Returns: PIL.Image RGB at (W*scale, H*scale).
+        """
+        if scale not in (2, 4):
+            raise HTTPException(400, "scale must be 2 or 4")
+
+        model = self.swin2sr_x4 if scale == 4 else self.swin2sr_x2
+
+        rgb = image_obj.convert("RGB")
+        src = np.asarray(rgb, dtype=np.float32) / 255.0  # H, W, 3
+        h, w, _ = src.shape
+
+        tile = 256
+        overlap = 32
+        step = tile - overlap
+        out_h, out_w = h * scale, w * scale
+        accum = np.zeros((out_h, out_w, 3), dtype=np.float32)
+        weight = np.zeros((out_h, out_w, 1), dtype=np.float32)
+
+        # Pre-compute 1-D triangular blend window (peak in center → seamless overlap).
+        def _blend_window(length: int, ov: int) -> np.ndarray:
+            win = np.ones(length, dtype=np.float32)
+            ramp = np.linspace(0.0, 1.0, ov, endpoint=False, dtype=np.float32)
+            win[:ov] = ramp
+            win[-ov:] = ramp[::-1]
+            return win
+
+        # Iterate tiles. Last tile snaps to edge so we cover the right/bottom border.
+        ys = list(range(0, max(1, h - overlap), step))
+        if ys[-1] + tile < h:
+            ys.append(h - tile if h > tile else 0)
+        xs = list(range(0, max(1, w - overlap), step))
+        if xs[-1] + tile < w:
+            xs.append(w - tile if w > tile else 0)
+
+        for y in ys:
+            for x in xs:
+                ty = max(0, min(y, max(0, h - tile)))
+                tx = max(0, min(x, max(0, w - tile)))
+                tile_h = min(tile, h - ty)
+                tile_w = min(tile, w - tx)
+                tile_arr = src[ty:ty + tile_h, tx:tx + tile_w, :]
+
+                tile_pil = Image.fromarray(
+                    np.clip(tile_arr * 255.0, 0, 255).astype(np.uint8)
+                )
+                processor = self.swin2sr_proc_x4 if scale == 4 else self.swin2sr_proc_x2
+                inputs = processor(tile_pil, return_tensors="pt")
+                pixel_values = inputs["pixel_values"].to("cuda").half()
+
+                with torch.no_grad():
+                    output = model(pixel_values=pixel_values).reconstruction
+
+                # output: 1, 3, h*scale_padded, w*scale_padded — crop to expected size.
+                arr = output.squeeze(0).clamp_(0, 1).float().cpu().numpy()
+                arr = np.transpose(arr, (1, 2, 0))[: tile_h * scale, : tile_w * scale, :]
+
+                ah, aw = arr.shape[:2]
+                ov = overlap * scale
+                wy = _blend_window(ah, min(ov, ah // 2)) if ah > ov else np.ones(ah, dtype=np.float32)
+                wx = _blend_window(aw, min(ov, aw // 2)) if aw > ov else np.ones(aw, dtype=np.float32)
+                window = (wy[:, None] * wx[None, :])[:, :, None]
+
+                oy, ox = ty * scale, tx * scale
+                accum[oy:oy + ah, ox:ox + aw, :] += arr * window
+                weight[oy:oy + ah, ox:ox + aw, :] += window
+
+        result = accum / np.clip(weight, 1e-6, None)
+        result_u8 = np.clip(result * 255.0, 0, 255).astype(np.uint8)
+        return Image.fromarray(result_u8, mode="RGB")
 
     def _pil_to_bgr(self, image_obj):
         """PIL Image (any mode) → contiguous BGR uint8 ndarray expected by Real-ESRGAN/GFPGAN."""
@@ -408,7 +518,7 @@ class Knockout:
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling API.",
-            version="0.5.1",
+            version="0.6.0",
         )
 
         web.add_middleware(
@@ -435,7 +545,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.5.1",
+                "version": "0.6.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -957,44 +1067,61 @@ class Knockout:
         def upscale_endpoint(
             file: UploadFile = File(...),
             scale: int = Form(4),
+            model: str = Form("swin2sr"),
             face_enhance: bool = Form(False),
             format: str = Form("png"),
             authorization: Optional[str] = Header(default=None),
         ):
             """
-            Real-ESRGAN x4 super-resolution.
+            Super-resolution. Two backends:
 
-            `scale` 2 or 4. `face_enhance=true` routes through GFPGAN to fix facial
-            detail (slower; use for portraits). Tile inference handles arbitrarily
-            large inputs without OOM.
+            - `model=swin2sr` (default, v0.6.0+): SwinV2 transformer, sharper detail
+              and natural texture on real photos. Successor to SwinIR.
+            - `model=realesrgan`: Real-ESRGAN x4plus. Better on anime / illustrations,
+              tends to produce a painted look on photos.
+
+            `scale` 2 or 4. `face_enhance=true` routes through GFPGAN (Real-ESRGAN
+            backend only — kept for backwards compatibility).
             """
             self._check_auth(authorization)
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
             if scale not in (2, 4):
                 raise HTTPException(400, "scale must be 2 or 4")
 
+            model_choice = model.strip().lower()
+            if model_choice not in {"swin2sr", "realesrgan"}:
+                raise HTTPException(400, "model must be 'swin2sr' or 'realesrgan'")
+
             data = file.file.read()
             image_obj = self._open_image(data)
-            bgr = self._pil_to_bgr(image_obj)
 
             try:
                 if face_enhance:
+                    bgr = self._pil_to_bgr(image_obj)
                     _, _, output_bgr = self.face_restorer.enhance(
                         bgr,
                         has_aligned=False,
                         only_center_face=False,
                         paste_back=True,
                     )
+                    if output_bgr is None:
+                        raise HTTPException(500, "upscale produced no output")
+                    output_pil = self._bgr_to_pil(output_bgr)
+                elif model_choice == "swin2sr":
+                    output_pil = self._swin2sr_upscale(image_obj, scale)
                 else:
+                    bgr = self._pil_to_bgr(image_obj)
                     output_bgr, _ = self.upscaler.enhance(bgr, outscale=scale)
+                    if output_bgr is None:
+                        raise HTTPException(500, "upscale produced no output")
+                    output_pil = self._bgr_to_pil(output_bgr)
+            except HTTPException:
+                raise
             except RuntimeError as e:
                 raise HTTPException(500, f"upscale failed: {e}")
 
-            if output_bgr is None:
-                raise HTTPException(500, "upscale produced no output")
-
             self._bump_counter()
-            return self._response(self._bgr_to_pil(output_bgr), fmt)
+            return self._response(output_pil, fmt)
 
         @web.post("/face-restore")
         def face_restore_endpoint(
