@@ -1,0 +1,14 @@
+# GitHub Sponsors needs to be enabled separately at https://github.com/sponsors
+# Until then, the GitHub UI will hide the Sponsor button gracefully.
+github: TroyJLorents-GH
+
+# Uncomment any of the below as you set them up.
+# Multiple are allowed and GitHub will show all of them on the repo's Sponsor button.
+#
+# ko_fi: your-handle
+# buy_me_a_coffee: your-handle
+# patreon: your-handle
+# polar: your-handle
+# liberapay: your-handle
+# open_collective: your-collective
+# custom: ['https://your-stripe-or-paypal-link.example']
