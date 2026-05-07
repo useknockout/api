@@ -20,11 +20,23 @@ Test (remote URL):
       -o cat-nobg.png
 """
 import base64
+import hashlib
 import io
+import json
 import os
-from typing import List, Optional
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from typing import List, Optional, Tuple
 
 import modal
+
+
+def _now_iso() -> str:
+    """ISO-8601 UTC timestamp for Postgres timestamptz columns."""
+    return datetime.now(timezone.utc).isoformat()
 
 APP_NAME = "api"
 MODEL_REPO = "ZhengPeng7/BiRefNet"
@@ -240,20 +252,253 @@ class Knockout:
         self.swin2sr_proc_x4 = AutoImageProcessor.from_pretrained(SWIN2SR_X4_REPO)
         self.swin2sr_proc_x2 = AutoImageProcessor.from_pretrained(SWIN2SR_X2_REPO)
 
-    def _check_auth(self, authorization: Optional[str]) -> None:
-        raw = os.environ.get("API_TOKEN", "").strip()
-        if not raw:
-            return  # no tokens configured → open API (dev only)
+    # =========================================================================
+    # Auth + usage logging
+    # =========================================================================
+    # Two paths:
+    #   1. Legacy / public-beta — token in API_TOKEN env (comma-separated).
+    #      Returns context with user_id=None, tier="free". No DB lookup.
+    #   2. Per-user kno_live_<32> / kno_test_<32> — SHA-256 hashed and looked
+    #      up in Supabase tokens table. Returns full context (user_id, token_id,
+    #      tier) used by usage logging + meter reporting.
+    #
+    # _check_auth now returns the context dict so endpoints can call _log_usage
+    # afterwards. On failure it raises HTTPException as before.
 
-        valid = {t.strip() for t in raw.split(",") if t.strip()}
-        if not valid:
-            return
+    def _supabase_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        body: Optional[dict] = None,
+        prefer: Optional[str] = None,
+    ) -> Tuple[int, bytes]:
+        """Talk to Supabase REST. Service role bypasses RLS — only run server-side."""
+        url = os.environ["SUPABASE_URL"].rstrip("/") + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params, safe=",.()*=:")
+        headers = {
+            "apikey": os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+            "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_ROLE_KEY']}",
+            "Content-Type": "application/json",
+        }
+        if prefer:
+            headers["Prefer"] = prefer
+        data = json.dumps(body).encode("utf-8") if body is not None else None
+        req = urllib.request.Request(url, method=method, headers=headers, data=data)
+        try:
+            with urllib.request.urlopen(req, timeout=5) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+        except Exception:
+            return 0, b""
 
+    def _check_auth(self, authorization: Optional[str]) -> dict:
+        """Returns a TokenContext dict. Raises HTTPException on auth failure."""
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Missing bearer token")
         presented = authorization.split(" ", 1)[1].strip()
-        if presented not in valid:
-            raise HTTPException(status_code=403, detail="Invalid token")
+        if not presented:
+            raise HTTPException(status_code=401, detail="Empty bearer token")
+
+        # Path 1: legacy / public-beta token via API_TOKEN env.
+        legacy_raw = os.environ.get("API_TOKEN", "").strip()
+        legacy_set = {t.strip() for t in legacy_raw.split(",") if t.strip()}
+        if presented in legacy_set:
+            return {"user_id": None, "token_id": None, "tier": "free", "is_legacy": True}
+
+        # Path 2: per-user kno_* token. SHA-256 hashed lookup.
+        if not presented.startswith("kno_"):
+            raise HTTPException(status_code=401, detail="Invalid token format")
+
+        hashed = hashlib.sha256(presented.encode("utf-8")).hexdigest()
+
+        status, body = self._supabase_request(
+            "GET",
+            "/rest/v1/tokens",
+            params={
+                "select": "id,user_id,scopes,revoked_at",
+                "hashed_token": f"eq.{hashed}",
+                "revoked_at": "is.null",
+                "limit": "1",
+            },
+        )
+        if status != 200:
+            raise HTTPException(status_code=503, detail="Auth service unavailable")
+        try:
+            rows = json.loads(body) if body else []
+        except json.JSONDecodeError:
+            rows = []
+        if not rows:
+            raise HTTPException(status_code=401, detail="Invalid or revoked token")
+
+        row = rows[0]
+        token_id = row["id"]
+        user_id = row["user_id"]
+        scopes = row.get("scopes") or []
+
+        # Look up tier on the user.
+        ustatus, ubody = self._supabase_request(
+            "GET",
+            "/rest/v1/users",
+            params={
+                "select": "tier,stripe_customer_id",
+                "id": f"eq.{user_id}",
+                "limit": "1",
+            },
+        )
+        tier = "free"
+        stripe_customer_id = None
+        if ustatus == 200:
+            try:
+                urows = json.loads(ubody) if ubody else []
+                if urows:
+                    tier = urows[0].get("tier") or "free"
+                    stripe_customer_id = urows[0].get("stripe_customer_id")
+            except json.JSONDecodeError:
+                pass
+
+        # Bump last_used_at (best-effort, fire-and-forget).
+        try:
+            self._supabase_request(
+                "PATCH",
+                "/rest/v1/tokens",
+                params={"id": f"eq.{token_id}"},
+                body={"last_used_at": _now_iso()},
+            )
+        except Exception:
+            pass
+
+        return {
+            "user_id": user_id,
+            "token_id": token_id,
+            "tier": tier,
+            "scopes": scopes,
+            "stripe_customer_id": stripe_customer_id,
+            "is_legacy": False,
+        }
+
+    def _check_scope(self, ctx: dict, endpoint: str) -> None:
+        """If a token has scopes, deny calls to endpoints not in the list."""
+        scopes = ctx.get("scopes") or []
+        if not scopes:
+            return  # full-access token
+        if endpoint not in scopes:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Token not authorized for {endpoint}",
+            )
+
+    def _enforce_quota(self, ctx: dict) -> None:
+        """Free tier: 50 images/month. Paid tiers: no monthly cap."""
+        if ctx.get("is_legacy"):
+            return
+        if ctx.get("tier") != "free":
+            return
+        user_id = ctx.get("user_id")
+        if not user_id:
+            return
+        # Rough check: count rows in usage_current_month view.
+        status, body = self._supabase_request(
+            "GET",
+            "/rest/v1/usage_current_month",
+            params={
+                "select": "call_count",
+                "user_id": f"eq.{user_id}",
+                "limit": "1",
+            },
+        )
+        if status == 200 and body:
+            try:
+                rows = json.loads(body)
+                if rows:
+                    used = int(rows[0].get("call_count") or 0)
+                    if used >= 50:
+                        raise HTTPException(
+                            status_code=402,
+                            detail="Free tier monthly quota (50) exhausted. Upgrade at useknockout.com/pricing.",
+                        )
+            except (json.JSONDecodeError, ValueError, TypeError):
+                pass
+
+    def _log_usage(
+        self,
+        ctx: dict,
+        endpoint: str,
+        status: int,
+        latency_ms: int,
+    ) -> None:
+        """Insert a usage row + fire a Stripe meter event for paid tiers."""
+        if ctx.get("is_legacy"):
+            # Public-beta calls — don't pollute the per-user usage table.
+            return
+        user_id = ctx.get("user_id")
+        token_id = ctx.get("token_id")
+        if not user_id:
+            return
+
+        # 1. Usage row in Supabase
+        try:
+            self._supabase_request(
+                "POST",
+                "/rest/v1/usage",
+                body={
+                    "user_id": user_id,
+                    "token_id": token_id,
+                    "endpoint": endpoint,
+                    "status": status,
+                    "latency_ms": latency_ms,
+                },
+                prefer="return=minimal",
+            )
+        except Exception:
+            pass
+
+        # 2. Stripe meter event for paid tiers
+        if 200 <= status < 300 and ctx.get("tier") in {"payg", "volume"}:
+            self._report_meter(ctx)
+
+    def _begin(self, authorization: Optional[str], endpoint: str) -> Tuple[dict, float]:
+        """One call → auth + scope + quota + start timer. Use at top of each handler."""
+        ctx = self._check_auth(authorization)
+        self._check_scope(ctx, endpoint)
+        self._enforce_quota(ctx)
+        return ctx, time.perf_counter()
+
+    def _end(self, ctx: dict, endpoint: str, start: float, status: int = 200) -> None:
+        """Use after handler finishes. Records usage row + fires Stripe meter."""
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        self._log_usage(ctx, endpoint, status, latency_ms)
+
+    def _report_meter(self, ctx: dict) -> None:
+        """Fire one Stripe meter event per successful call."""
+        sk = os.environ.get("STRIPE_SECRET_KEY", "").strip()
+        event_name = os.environ.get("STRIPE_METER_EVENT_NAME", "images.processed").strip()
+        customer = ctx.get("stripe_customer_id")
+        if not sk or not customer:
+            return
+        try:
+            data = urllib.parse.urlencode({
+                "event_name": event_name,
+                "timestamp": int(time.time()),
+                "payload[value]": "1",
+                "payload[stripe_customer_id]": customer,
+                "identifier": f"uk_{ctx.get('token_id') or 'na'}_{int(time.time() * 1000)}",
+            }).encode("utf-8")
+            req = urllib.request.Request(
+                "https://api.stripe.com/v1/billing/meter_events",
+                method="POST",
+                headers={
+                    "Authorization": f"Bearer {sk}",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                data=data,
+            )
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception:
+            # Meter loss tolerated — don't fail the customer call on Stripe hiccups.
+            pass
 
     def _check_format(self, fmt: str, allowed=frozenset({"png", "webp"})) -> str:
         fmt = fmt.lower()
@@ -603,19 +848,21 @@ class Knockout:
             format: str = "png",
             authorization: Optional[str] = Header(default=None),
         ):
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/remove")
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
             result = self._remove(image_obj)
-            return self._response(result, fmt)
+            resp = self._response(result, fmt)
+            self._end(ctx, "/remove", _t)
+            return resp
 
         @web.post("/remove-url")
         def remove_url_endpoint(
             body: UrlBody,
             authorization: Optional[str] = Header(default=None),
         ):
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/remove-url")
             fmt = self._check_format(body.format)
 
             try:
@@ -626,7 +873,9 @@ class Knockout:
 
             image_obj = self._open_image(resp.content)
             result = self._remove(image_obj)
-            return self._response(result, fmt)
+            out_resp = self._response(result, fmt)
+            self._end(ctx, "/remove-url", _t)
+            return out_resp
 
         @web.post("/replace-bg")
         def replace_bg_endpoint(
@@ -645,7 +894,7 @@ class Knockout:
 
             Output is opaque (no alpha). Use `format=jpg` for smallest file size.
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/replace-bg")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
 
             data = file.file.read()
@@ -663,7 +912,9 @@ class Knockout:
                 color = self._parse_color(bg_color)
                 composited = self._composite_on_bg(fg, color)
 
-            return self._response(composited, fmt)
+            resp = self._response(composited, fmt)
+            self._end(ctx, "/replace-bg", _t)
+            return resp
 
         @web.post("/remove-batch")
         def remove_batch_endpoint(
@@ -676,7 +927,7 @@ class Knockout:
 
             Returns JSON: {"count": N, "results": [{filename, success, format, data_base64 | error}]}.
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/remove-batch")
             fmt = self._check_format(format)
 
             if len(files) > 10:
@@ -704,7 +955,9 @@ class Knockout:
                     item.update({"success": False, "error": str(e)})
                 results.append(item)
 
-            return {"count": len(results), "format": fmt, "results": results}
+            resp = {"count": len(results), "format": fmt, "results": results}
+            self._end(ctx, "/remove-batch", _t)
+            return resp
 
         @web.post("/mask")
         def mask_endpoint(
@@ -713,12 +966,14 @@ class Knockout:
             authorization: Optional[str] = Header(default=None),
         ):
             """Return just the alpha mask as a grayscale PNG/WebP (0 = bg, 255 = subject)."""
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/mask")
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
             _, mask = self._get_mask(image_obj)
-            return self._response(mask.convert("L"), fmt)
+            resp = self._response(mask.convert("L"), fmt)
+            self._end(ctx, "/mask", _t)
+            return resp
 
         @web.post("/smart-crop")
         def smart_crop_endpoint(
@@ -734,7 +989,7 @@ class Knockout:
             `transparent=true` (default): return cropped cutout with transparent background.
             `transparent=false`: return cropped region from the original image (bg preserved).
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/smart-crop")
             allowed = frozenset({"png", "webp", "jpg"}) if not transparent else frozenset({"png", "webp"})
             fmt = self._check_format(format, allowed=allowed)
             data = file.file.read()
@@ -761,7 +1016,9 @@ class Knockout:
             else:
                 cropped = rgb.crop((left, top, right, bottom))
 
-            return self._response(cropped, fmt)
+            resp = self._response(cropped, fmt)
+            self._end(ctx, "/smart-crop", _t)
+            return resp
 
         @web.post("/shadow")
         def shadow_endpoint(
@@ -777,7 +1034,7 @@ class Knockout:
             authorization: Optional[str] = Header(default=None),
         ):
             """Compose subject onto new bg with a configurable drop shadow."""
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/shadow")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -805,7 +1062,9 @@ class Knockout:
                 opacity=max(0.0, min(1.0, float(shadow_opacity))),
                 shadow_color=self._parse_color(shadow_color),
             )
-            return self._response(composed, fmt)
+            resp = self._response(composed, fmt)
+            self._end(ctx, "/shadow", _t)
+            return resp
 
         @web.post("/sticker")
         def sticker_endpoint(
@@ -819,7 +1078,7 @@ class Knockout:
             Sticker style — subject with a thick outline on a transparent background.
             Perfect for WhatsApp/iMessage/Telegram stickers.
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/sticker")
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -839,7 +1098,9 @@ class Knockout:
             out = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
             out.alpha_composite(stroke_layer)
             out.alpha_composite(subject)
-            return self._response(out, fmt)
+            resp = self._response(out, fmt)
+            self._end(ctx, "/sticker", _t)
+            return resp
 
         @web.post("/outline")
         def outline_endpoint(
@@ -850,7 +1111,7 @@ class Knockout:
             authorization: Optional[str] = Header(default=None),
         ):
             """Subject on transparent bg with a thin configurable outline."""
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/outline")
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -876,7 +1137,9 @@ class Knockout:
             out = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
             out.alpha_composite(ring_layer)
             out.alpha_composite(subject)
-            return self._response(out, fmt)
+            resp = self._response(out, fmt)
+            self._end(ctx, "/outline", _t)
+            return resp
 
         @web.post("/studio-shot")
         def studio_shot_endpoint(
@@ -893,7 +1156,7 @@ class Knockout:
 
             `aspect`: "1:1", "4:5", "16:9", "3:2", or "W:H" (ints). Default 1:1.
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/studio-shot")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -956,7 +1219,9 @@ class Knockout:
                 composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
                 composed = composed.convert("RGB")
 
-            return self._response(composed, fmt)
+            resp = self._response(composed, fmt)
+            self._end(ctx, "/studio-shot", _t)
+            return resp
 
         @web.post("/compare")
         def compare_endpoint(
@@ -968,7 +1233,7 @@ class Knockout:
             Before/after preview — original on the left, cutout over a checkerboard on the right.
             Perfect for marketing screenshots and social media.
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/compare")
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -987,7 +1252,9 @@ class Knockout:
             canvas_rgba.alpha_composite(cutout, dest=(w, 0))
             canvas = canvas_rgba.convert("RGB")
 
-            return self._response(canvas, fmt)
+            resp = self._response(canvas, fmt)
+            self._end(ctx, "/compare", _t)
+            return resp
 
         @web.post("/remove-batch-url")
         def remove_batch_url_endpoint(
@@ -999,7 +1266,7 @@ class Knockout:
 
             Body: {"urls": ["https://...", ...], "format": "png" | "webp"}
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/remove-batch-url")
             fmt = self._check_format(body.format)
 
             if len(body.urls) > 10:
@@ -1031,7 +1298,9 @@ class Knockout:
                     item.update({"success": False, "error": str(e)})
                 results.append(item)
 
-            return {"count": len(results), "format": fmt, "results": results}
+            out_resp = {"count": len(results), "format": fmt, "results": results}
+            self._end(ctx, "/remove-batch-url", _t)
+            return out_resp
 
         @web.get("/stats")
         def stats_endpoint():
@@ -1083,7 +1352,7 @@ class Knockout:
             `scale` 2 or 4. `face_enhance=true` routes through GFPGAN (Real-ESRGAN
             backend only — kept for backwards compatibility).
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/upscale")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
             if scale not in (2, 4):
                 raise HTTPException(400, "scale must be 2 or 4")
@@ -1121,7 +1390,9 @@ class Knockout:
                 raise HTTPException(500, f"upscale failed: {e}")
 
             self._bump_counter()
-            return self._response(output_pil, fmt)
+            resp = self._response(output_pil, fmt)
+            self._end(ctx, "/upscale", _t)
+            return resp
 
         @web.post("/face-restore")
         def face_restore_endpoint(
@@ -1142,7 +1413,7 @@ class Knockout:
 
             Set `only_center_face=true` to restore only the most prominent face (faster).
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/face-restore")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
 
             data = file.file.read()
@@ -1164,7 +1435,9 @@ class Knockout:
                 raise HTTPException(500, "face-restore produced no output")
 
             self._bump_counter()
-            return self._response(self._bgr_to_pil(output_bgr), fmt)
+            resp = self._response(self._bgr_to_pil(output_bgr), fmt)
+            self._end(ctx, "/face-restore", _t)
+            return resp
 
         @web.post("/preview")
         def preview_endpoint(
@@ -1180,7 +1453,7 @@ class Knockout:
             skips the pymatting refinement pass. Returns a transparent PNG/WebP.
             ~80ms warm vs ~200ms for /remove.
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/preview")
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -1203,7 +1476,9 @@ class Knockout:
 
             result = rgb_small.convert("RGBA")
             result.putalpha(mask)
-            return self._response(result, fmt)
+            resp = self._response(result, fmt)
+            self._end(ctx, "/preview", _t)
+            return resp
 
         @web.post("/estimate")
         def estimate_endpoint(body: EstimateBody):
@@ -1263,7 +1538,7 @@ class Knockout:
             copy of the original (set `bg_blur=true`). `head_top_ratio` controls
             how much empty space sits above the subject (default 18% of canvas).
             """
-            self._check_auth(authorization)
+            ctx, _t = self._begin(authorization, "/headshot")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -1328,6 +1603,8 @@ class Knockout:
                 opacity=0.30,
                 shadow_color=(0, 0, 0),
             )
-            return self._response(composed, fmt)
+            resp = self._response(composed, fmt)
+            self._end(ctx, "/headshot", _t)
+            return resp
 
         return web
