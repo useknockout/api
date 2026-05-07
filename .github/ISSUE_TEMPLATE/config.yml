@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Documentation & API reference
+    url: https://useknockout.com
+    about: Endpoint reference, SDK quickstarts, self-hosting guides — most questions are answered here.
+  - name: Quick questions on X
+    url: https://x.com/useknockout
+    about: For one-line questions, DMs are usually the fastest reply.

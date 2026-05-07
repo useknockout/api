@@ -1,0 +1,71 @@
+name: Model suggestion
+description: A SOTA model you think would improve quality (background removal, super-res, face restore, etc.)
+title: "[Model] "
+labels: ["model", "research"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Suggest a model to add or swap in. Be honest about trade-offs — speed, quality, license — so we can decide together whether it makes sense.
+
+        **Important:** the API targets `~200ms warm` latency. Diffusion-based models that take 10+ seconds per image will not become defaults but may make sense as an opt-in for users who'd trade latency for quality.
+
+  - type: input
+    id: model_name
+    attributes:
+      label: Model name
+      placeholder: DiffDIS, HAT, NAFNet, Restormer, ...
+    validations:
+      required: true
+
+  - type: input
+    id: paper_or_repo
+    attributes:
+      label: Paper or repo URL
+      placeholder: https://github.com/qianyu-dlut/DiffDIS
+    validations:
+      required: true
+
+  - type: dropdown
+    id: replaces
+    attributes:
+      label: Which existing model would this replace or augment?
+      options:
+        - BiRefNet (background removal)
+        - Swin2SR (super-resolution default)
+        - Real-ESRGAN (super-resolution opt-in)
+        - GFPGAN (face restoration)
+        - New capability — no existing model
+    validations:
+      required: true
+
+  - type: input
+    id: license
+    attributes:
+      label: License
+      description: MIT / Apache-2 / BSD are easy. GPL / "research only" / "non-commercial" are hard or impossible to ship in this MIT-licensed API.
+      placeholder: MIT
+    validations:
+      required: true
+
+  - type: textarea
+    id: tradeoffs
+    attributes:
+      label: Honest trade-offs
+      description: Quality gain, speed cost, hardware requirements, license.
+      placeholder: |
+        Quality: +2 IoU on DIS5K vs BiRefNet
+        Speed: ~30s/image (diffusion sampling) vs ~150ms (BiRefNet feed-forward)
+        VRAM: 12 GB minimum
+        License: MIT
+        Default-suitable? No — opt-in only.
+    validations:
+      required: true
+
+  - type: textarea
+    id: failure_cases
+    attributes:
+      label: Specific failure cases this model handles better
+      description: Where does the current model fail that this one wins? Hair, glass, low-contrast edges, fine detail, particular subjects?
+    validations:
+      required: false

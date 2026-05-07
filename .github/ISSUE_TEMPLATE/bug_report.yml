@@ -1,0 +1,100 @@
+name: Bug report
+description: Something is broken — wrong output, error, unexpected behavior, performance regression.
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for filing a bug. The more reproducible the report, the faster the fix.
+        **Don't paste your API token anywhere in this issue.** Use `$TOKEN` in command examples.
+
+  - type: dropdown
+    id: endpoint
+    attributes:
+      label: Which endpoint?
+      options:
+        - /remove
+        - /remove-url
+        - /replace-bg
+        - /remove-batch
+        - /remove-batch-url
+        - /mask
+        - /sticker
+        - /outline
+        - /smart-crop
+        - /shadow
+        - /studio-shot
+        - /headshot
+        - /upscale
+        - /face-restore
+        - /preview
+        - /estimate
+        - /health or /stats
+        - Multiple / SDK-level
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deployment
+    attributes:
+      label: Hosted endpoint or self-hosted?
+      options:
+        - Hosted (useknockout--api.modal.run)
+        - Self-hosted on Modal
+        - Self-hosted on another GPU host (Docker, BYO)
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you call, what did you get back, what did you expect?
+      placeholder: |
+        I called /upscale with scale=4 on a 4096x4096 PNG.
+        The response was empty (0 bytes) after about 2:30.
+        I expected an upscaled PNG.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: Reproduction (curl or SDK snippet)
+      description: A minimal command or code snippet that reproduces. Replace your token with `$TOKEN`.
+      render: shell
+      placeholder: |
+        curl -X POST "https://useknockout--api.modal.run/upscale" \
+          -H "Authorization: Bearer $TOKEN" \
+          -F "file=@input.png" \
+          -F "scale=4" \
+          -F "format=png" \
+          -o out.png
+    validations:
+      required: false
+
+  - type: textarea
+    id: input_details
+    attributes:
+      label: Input characteristics
+      description: Image dimensions, file size, format, content. Attach the input if you can share it.
+      placeholder: 4096x4096, ~19 MB PNG, portrait of a person, plain background
+    validations:
+      required: false
+
+  - type: input
+    id: sdk
+    attributes:
+      label: SDK / version (if applicable)
+      placeholder: "@useknockout/node@0.0.9, useknockout==0.0.4, etc."
+    validations:
+      required: false
+
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Screenshots, links to logs, related issues, theories.
+    validations:
+      required: false

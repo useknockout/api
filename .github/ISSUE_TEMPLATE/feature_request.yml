@@ -1,0 +1,60 @@
+name: Feature request
+description: New endpoint, parameter, or capability you want.
+title: "[Feature] "
+labels: ["feature"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell me what you want to build that you currently can't, or that takes too many manual steps. The user-facing task matters more than the technical solution.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the user-facing task, not the implementation. "I want to make iMessage-style stickers from product photos" is more useful than "add a stroke filter."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution / API
+      description: What endpoint, params, or behavior change would solve it? Sketch the API if you have one in mind.
+      render: yaml
+      placeholder: |
+        POST /sticker
+          file: image (required)
+          stroke_width: int (default 8)
+          stroke_color: hex (default white)
+          format: png | webp (default png)
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Workarounds you've tried
+      description: What did you do today to get the result? (Helps me understand the pain.)
+    validations:
+      required: false
+
+  - type: dropdown
+    id: priority
+    attributes:
+      label: How blocking is this for you?
+      options:
+        - Nice to have
+        - Working around it now
+        - Blocking my use case
+    validations:
+      required: false
+
+  - type: input
+    id: context
+    attributes:
+      label: What are you building with useknockout?
+      description: Context helps prioritize. (Optional.)
+      placeholder: e.g. e-commerce product photo pipeline, social media tool, internal automation
+    validations:
+      required: false
