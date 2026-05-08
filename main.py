@@ -112,6 +112,17 @@ def _download_model() -> None:
             print(f"Downloading {name} -> gfpgan/weights/...")
             urllib.request.urlretrieve(url, dest)
 
+    # DDColor (Apache-2.0) — colorization. Pre-fetch the modelscope snapshot
+    # so cold starts skip the ~870 MB download. Network errors here are
+    # non-fatal: pipeline() will lazy-fetch at request time as a fallback.
+    try:
+        from modelscope import snapshot_download
+
+        print("Pre-fetching DDColor weights (~870 MB)...")
+        snapshot_download("damo/cv_ddcolor_image-colorization")
+    except Exception as e:
+        print(f"DDColor pre-fetch skipped: {e!r}")
+
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -141,6 +152,21 @@ image = (
     )
     # basicsr install bumps numpy to 2.x — pin back to 1.26.4 to keep pymatting + PIL stable.
     .pip_install("numpy==1.26.4")
+    # DDColor (Apache-2.0) for /colorize via ModelScope. ModelScope brings
+    # its own pipeline registry — keeps DDColor's basicsr fork isolated from
+    # the basicsr we already use for Real-ESRGAN/GFPGAN.
+    # ModelScope's pipelines.base unconditionally imports a dependency chain
+    # that requires datasets, oss2, addict, simplejson, sortedcontainers —
+    # none of which are auto-installed by `pip install modelscope`. Front-load
+    # all of them to avoid iterative rebuilds chasing missing modules.
+    .pip_install(
+        "modelscope==1.18.1",
+        "datasets==2.21.0",
+        "oss2==2.18.5",
+        "addict==2.4.0",
+        "simplejson==3.19.2",
+        "sortedcontainers==2.4.0",
+    )
     # basicsr 1.4.2 + facexlib import `torchvision.transforms.functional_tensor`,
     # removed in torchvision 0.17+. Patch every file in site-packages that
     # references it. Uses grep to find files (no Python import — would crash).
@@ -177,6 +203,11 @@ with image.imports():
         AutoModelForImageSegmentation,
         Swin2SRForImageSuperResolution,
     )
+
+    # ModelScope pipeline for DDColor (/colorize endpoint). Imported lazily
+    # at container-init time — heavy import, so don't pull at module scope.
+    from modelscope.outputs import OutputKeys
+    from modelscope.pipelines import pipeline as ms_pipeline
 
 app = modal.App(APP_NAME, image=image)
 
@@ -251,6 +282,15 @@ class Knockout:
         ).to("cuda").eval().half()
         self.swin2sr_proc_x4 = AutoImageProcessor.from_pretrained(SWIN2SR_X4_REPO)
         self.swin2sr_proc_x2 = AutoImageProcessor.from_pretrained(SWIN2SR_X2_REPO)
+
+        # DDColor — diffusion-free colorization (Apache-2.0). ConvNeXt-Large
+        # backbone predicts ab channels in LAB color space. Single feed-forward
+        # (no diffusion sampling), ~500ms warm on L4. Inputs can be color or
+        # B&W; the model treats input as grayscale internally.
+        self.colorizer = ms_pipeline(
+            "image-colorization",
+            model="damo/cv_ddcolor_image-colorization",
+        )
 
     # =========================================================================
     # Auth + usage logging
@@ -762,8 +802,8 @@ class Knockout:
     def fastapi_app(self):
         web = FastAPI(
             title="useknockout",
-            description="State-of-the-art background removal + upscaling API.",
-            version="0.6.0",
+            description="State-of-the-art background removal + upscaling + colorization API.",
+            version="0.7.0",
         )
 
         web.add_middleware(
@@ -790,7 +830,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.6.0",
+                "version": "0.7.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -808,6 +848,7 @@ class Knockout:
                     "POST /preview",
                     "POST /upscale",
                     "POST /face-restore",
+                    "POST /colorize",
                     "POST /estimate",
                     "GET /stats",
                     "GET /health",
@@ -1437,6 +1478,42 @@ class Knockout:
             self._bump_counter()
             resp = self._response(self._bgr_to_pil(output_bgr), fmt)
             self._end(ctx, "/face-restore", _t)
+            return resp
+
+        @web.post("/colorize")
+        def colorize_endpoint(
+            file: UploadFile = File(...),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            DDColor — colorize black-and-white or grayscale photos.
+
+            Apache-2.0 licensed. ConvNeXt-Large backbone predicts ab channels
+            in LAB color space. Single feed-forward (no diffusion sampling),
+            ~500ms warm on L4. Works on any RGB input — color images are
+            processed too (treated as grayscale internally).
+            """
+            ctx, _t = self._begin(authorization, "/colorize")
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+
+            data = file.file.read()
+            image_obj = self._open_image(data)
+
+            # DDColor expects BGR uint8 (OpenCV convention). Same flow as Real-ESRGAN.
+            bgr = self._pil_to_bgr(image_obj)
+            try:
+                result = self.colorizer(bgr)
+                output_bgr = result.get(OutputKeys.OUTPUT_IMG)
+            except Exception as e:
+                raise HTTPException(500, f"colorize failed: {e}")
+
+            if output_bgr is None:
+                raise HTTPException(500, "colorize produced no output")
+
+            self._bump_counter()
+            resp = self._response(self._bgr_to_pil(output_bgr), fmt)
+            self._end(ctx, "/colorize", _t)
             return resp
 
         @web.post("/preview")
