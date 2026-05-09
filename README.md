@@ -489,6 +489,24 @@ curl -X POST "https://useknockout--api.modal.run/face-restore" \
 
 **Use cases:** old family photos, Zoom screenshots, dating app pics, restore CCTV stills.
 
+### `POST /colorize` (v0.7.0)
+
+**DDColor colorization.** Adds plausible color to black-and-white or grayscale photos. Apache-2.0 licensed, ConvNeXt-Large backbone predicting `ab` channels in LAB color space. Single feed-forward pass — no diffusion sampling — ~500ms warm on L4. Color inputs are accepted too (treated as grayscale internally).
+
+```bash
+curl -X POST "https://useknockout--api.modal.run/colorize" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@old-photo.jpg" \
+  -o colorized.png
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source image (B&W, grayscale, or color). |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+**Use cases:** colorize family archives, historical photos, B&W scans, vintage stock imagery.
+
 ### `GET /health`
 
 Returns `{"status":"ok","model":"ZhengPeng7/BiRefNet"}`. No auth required.
