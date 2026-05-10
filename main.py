@@ -884,6 +884,64 @@ class Knockout:
                 "sdk": "npm i @useknockout/node",
             }
 
+        # GET info handlers for every POST-only endpoint. Converts the 405s
+        # browsers / curl visitors produce into 200s with a working curl
+        # example. Same pattern as /remove and /remove-url above; registered
+        # in a loop to keep the surface area in one place. To add a new
+        # endpoint, append to POST_ONLY_INFO and the GET handler appears.
+        POST_ONLY_INFO = {
+            "/replace-bg": ("multipart 'file' + 'bg_color' hex OR 'bg_url'", "client.replaceBackground({ file, bgColor: '#FFFFFF' })"),
+            "/remove-batch": ("multipart 'files' (1..10 images)", "client.removeBatch({ files: ['./a.jpg', './b.jpg'] })"),
+            "/remove-batch-url": ("JSON { urls: string[1..10], format }", "client.removeBatchUrl({ urls: ['https://...'] })"),
+            "/mask": ("multipart 'file' — returns grayscale alpha matte", "client.mask({ file })"),
+            "/smart-crop": ("multipart 'file' + 'padding' + 'transparent'", "client.smartCrop({ file, padding: 24 })"),
+            "/shadow": ("multipart 'file' + bg/shadow color & offset params", "client.shadow({ file, shadowOffsetY: 12 })"),
+            "/sticker": ("multipart 'file' + 'stroke_color' + 'stroke_width'", "client.sticker({ file, strokeWidth: 24 })"),
+            "/outline": ("multipart 'file' + 'outline_color' + 'outline_width'", "client.outline({ file, outlineColor: '#000000' })"),
+            "/silhouette": ("multipart 'file' + 'subject_color' + 'bg_color'", "client.silhouette({ file, subjectColor: '#1E2960', bgColor: '#F0857C' })"),
+            "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow'", "client.studioShot({ file, aspect: '1:1' })"),
+            "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
+            "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
+            "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
+            "/upscale": ("multipart 'file' + 'scale' (2|4) + 'model' (swin2sr|realesrgan)", "client.upscale({ file, scale: 4 })"),
+            "/face-restore": ("multipart 'file' + 'only_center_face' + 'bg_enhance'", "client.faceRestore({ file })"),
+            "/colorize": ("multipart 'file' — DDColor grayscale→color", "client.colorize({ file })"),
+        }
+
+        def _make_post_info_handler(p: str, body: str, sdk: str):
+            def info_handler():
+                return {
+                    "error": "Use POST with multipart/form-data",
+                    "method": "POST",
+                    "path": p,
+                    "body": body,
+                    "headers": {"Authorization": "Bearer <token>"},
+                    "example_curl": (
+                        f"curl -X POST https://useknockout--api.modal.run{p} "
+                        f"-H 'Authorization: Bearer <token>' "
+                        f"-F 'file=@image.jpg' -o out.png"
+                    ),
+                    "sdk_example": sdk,
+                    "docs": "https://useknockout--api.modal.run/docs",
+                }
+            info_handler.__name__ = "info_" + p.lstrip("/").replace("-", "_")
+            return info_handler
+
+        for _p, (_body, _sdk) in POST_ONLY_INFO.items():
+            web.get(_p)(_make_post_info_handler(_p, _body, _sdk))
+
+        # /estimate takes JSON not multipart — its GET-info shape differs.
+        @web.get("/estimate")
+        def estimate_info():
+            return {
+                "error": "Use POST with JSON body",
+                "method": "POST",
+                "body": {"endpoint": "remove", "width": 1024, "height": 1024},
+                "headers": {"Authorization": "Bearer <token>", "Content-Type": "application/json"},
+                "docs": "https://useknockout--api.modal.run/docs",
+                "sdk": "client.estimate({ endpoint: 'remove', width: 1024, height: 1024 })",
+            }
+
         @web.post("/remove")
         def remove_endpoint(
             file: UploadFile = File(...),
