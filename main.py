@@ -431,7 +431,7 @@ class Knockout:
             )
 
     def _enforce_quota(self, ctx: dict) -> None:
-        """Free tier: 50 images/month. Paid tiers: no monthly cap."""
+        """Free tier: 20 images/month. Paid tiers: no monthly cap."""
         if ctx.get("is_legacy"):
             return
         if ctx.get("tier") != "free":
@@ -454,10 +454,10 @@ class Knockout:
                 rows = json.loads(body)
                 if rows:
                     used = int(rows[0].get("call_count") or 0)
-                    if used >= 50:
+                    if used >= 20:
                         raise HTTPException(
                             status_code=402,
-                            detail="Free tier monthly quota (50) exhausted. Upgrade at useknockout.com/pricing.",
+                            detail="Free tier monthly quota (20) exhausted. Upgrade at useknockout.com/pricing.",
                         )
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
