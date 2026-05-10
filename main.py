@@ -803,7 +803,7 @@ class Knockout:
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling + colorization API.",
-            version="0.7.0",
+            version="0.7.1",
         )
 
         web.add_middleware(
@@ -830,7 +830,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.7.0",
+                "version": "0.7.1",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -842,6 +842,7 @@ class Knockout:
                     "POST /shadow",
                     "POST /sticker",
                     "POST /outline",
+                    "POST /silhouette",
                     "POST /studio-shot",
                     "POST /compare",
                     "POST /headshot",
@@ -1180,6 +1181,37 @@ class Knockout:
             out.alpha_composite(subject)
             resp = self._response(out, fmt)
             self._end(ctx, "/outline", _t)
+            return resp
+
+        @web.post("/silhouette")
+        def silhouette_endpoint(
+            file: UploadFile = File(...),
+            subject_color: str = Form("#7C3AED"),
+            bg_color: str = Form("#FFFFFF"),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Two-tone silhouette portrait — subject filled with one solid color,
+            background filled with another. Apple Music / Spotify avatar style.
+
+            Use for stylized profile pictures, podcast cover art, anonymized
+            portraits, or branding placeholders. Reuses BiRefNet for the mask
+            then composites with two flat colors — no extra model load.
+            """
+            ctx, _t = self._begin(authorization, "/silhouette")
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            rgb, mask = self._get_mask(image_obj)
+
+            bg_rgb = Image.new("RGB", rgb.size, self._parse_color(bg_color))
+            subject_rgb = Image.new("RGB", rgb.size, self._parse_color(subject_color))
+            bg_rgb.paste(subject_rgb, (0, 0), mask)
+
+            self._bump_counter()
+            resp = self._response(bg_rgb, fmt)
+            self._end(ctx, "/silhouette", _t)
             return resp
 
         @web.post("/studio-shot")
