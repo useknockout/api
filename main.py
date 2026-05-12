@@ -123,6 +123,16 @@ def _download_model() -> None:
     except Exception as e:
         print(f"DDColor pre-fetch skipped: {e!r}")
 
+    # LaMa weights (~200 MB) — instantiating SimpleLama triggers the one-time
+    # weight download into the user cache dir. Cold starts then skip the fetch.
+    try:
+        from simple_lama_inpainting import SimpleLama
+
+        print("Pre-fetching LaMa weights (~200 MB)...")
+        SimpleLama()
+    except Exception as e:
+        print(f"LaMa pre-fetch skipped: {e!r}")
+
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
@@ -167,6 +177,10 @@ image = (
         "simplejson==3.19.2",
         "sortedcontainers==2.4.0",
     )
+    # LaMa (Apache-2.0) for /inpaint via simple-lama-inpainting wrapper.
+    # Resolution-robust Large Mask Inpainting — deterministic, no prompts.
+    # Weight download (~200 MB) baked into the image below via SimpleLama() warmup.
+    .pip_install("simple-lama-inpainting==0.1.2")
     # basicsr 1.4.2 + facexlib import `torchvision.transforms.functional_tensor`,
     # removed in torchvision 0.17+. Patch every file in site-packages that
     # references it. Uses grep to find files (no Python import — would crash).
@@ -208,6 +222,9 @@ with image.imports():
     # at container-init time — heavy import, so don't pull at module scope.
     from modelscope.outputs import OutputKeys
     from modelscope.pipelines import pipeline as ms_pipeline
+
+    # LaMa (Apache-2.0) — large-mask inpainting for /inpaint.
+    from simple_lama_inpainting import SimpleLama
 
 app = modal.App(APP_NAME, image=image)
 
@@ -291,6 +308,10 @@ class Knockout:
             "image-colorization",
             model="damo/cv_ddcolor_image-colorization",
         )
+
+        # LaMa — large-mask inpainting (Apache-2.0). Resolution-robust, deterministic,
+        # no prompts. Used by /inpaint. Loads cached weights downloaded at build time.
+        self.inpainter = SimpleLama()
 
     # =========================================================================
     # Auth + usage logging
@@ -753,6 +774,44 @@ class Knockout:
         size = radius * 2 + 1
         return mask.filter(ImageFilter.MaxFilter(size))
 
+    def _inpaint(self, image_obj, mask, dilation: int):
+        """
+        LaMa-based inpainting with full-resolution preservation.
+
+        Pipeline: dilate mask → downscale to 1024 max-edge → run LaMa →
+        upscale result → composite over the original at full resolution so
+        unmasked pixels stay byte-identical to input.
+
+        `image_obj` and `mask` are PIL.Image. Returns PIL.Image RGB at
+        original full resolution.
+        """
+        rgb = image_obj.convert("RGB")
+        mask_l = mask.convert("L") if mask.mode != "L" else mask
+
+        dilation = max(0, min(int(dilation), 32))
+        mask_dilated = self._dilate_mask(mask_l, dilation)
+
+        w, h = rgb.size
+        max_dim = 1024
+        if max(w, h) > max_dim:
+            scale = max_dim / max(w, h)
+            sw, sh = int(round(w * scale)), int(round(h * scale))
+            rgb_small = rgb.resize((sw, sh), Image.LANCZOS)
+            mask_small = mask_dilated.resize((sw, sh), Image.NEAREST)
+        else:
+            rgb_small = rgb
+            mask_small = mask_dilated
+
+        inpainted_small = self.inpainter(rgb_small, mask_small)
+
+        if inpainted_small.size != (w, h):
+            inpainted = inpainted_small.resize((w, h), Image.LANCZOS)
+        else:
+            inpainted = inpainted_small
+
+        # Composite — only use inpainted where dilated mask is non-zero.
+        return Image.composite(inpainted, rgb, mask_dilated)
+
     def _checkerboard(self, size, square: int = 16, a=(230, 230, 230), b=(255, 255, 255)):
         """Generate a checkerboard RGB image matching `size` = (w, h). Used for /compare preview."""
         w, h = size
@@ -803,7 +862,7 @@ class Knockout:
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling + colorization API.",
-            version="0.7.1",
+            version="0.8.0",
         )
 
         web.add_middleware(
@@ -830,7 +889,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.7.1",
+                "version": "0.8.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -838,6 +897,7 @@ class Knockout:
                     "POST /remove-batch",
                     "POST /remove-batch-url",
                     "POST /mask",
+                    "POST /inpaint",
                     "POST /smart-crop",
                     "POST /shadow",
                     "POST /sticker",
@@ -899,6 +959,7 @@ class Knockout:
             "/sticker": ("multipart 'file' + 'stroke_color' + 'stroke_width'", "client.sticker({ file, strokeWidth: 24 })"),
             "/outline": ("multipart 'file' + 'outline_color' + 'outline_width'", "client.outline({ file, outlineColor: '#000000' })"),
             "/silhouette": ("multipart 'file' + 'subject_color' + 'bg_color'", "client.silhouette({ file, subjectColor: '#1E2960', bgColor: '#F0857C' })"),
+            "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
             "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow'", "client.studioShot({ file, aspect: '1:1' })"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
@@ -1270,6 +1331,98 @@ class Knockout:
             self._bump_counter()
             resp = self._response(bg_rgb, fmt)
             self._end(ctx, "/silhouette", _t)
+            return resp
+
+        @web.post("/inpaint")
+        def inpaint_endpoint(
+            file: UploadFile = File(...),
+            mask: Optional[UploadFile] = File(default=None),
+            x: Optional[int] = Form(default=None),
+            y: Optional[int] = Form(default=None),
+            w: Optional[int] = Form(default=None),
+            h: Optional[int] = Form(default=None),
+            dilation: int = Form(8),
+            format: str = Form("png"),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            LaMa-based image inpainting. Three modes, auto-detected:
+
+            1. `mask` field present → user-supplied mask (white = inpaint, black = keep)
+            2. `x,y,w,h` fields present → bbox mode (rectangular region)
+            3. Neither → auto-subject mode (BiRefNet derives subject mask, inverts it)
+
+            `dilation` (default 8) expands the mask by N pixels before inpainting.
+            Higher values reduce ghost outlines from tight masks; max 32.
+            """
+            ctx, _t = self._begin(authorization, "/inpaint")
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            if not (0 <= int(dilation) <= 32):
+                raise HTTPException(400, "dilation must be in range 0..32")
+
+            data = file.file.read()
+            image_obj = self._open_image(data)
+            img_w, img_h = image_obj.size
+
+            # Determine mode + build mask
+            mode: str
+            if mask is not None:
+                # Mode: user-supplied mask
+                mode = "mask"
+                mask_data = mask.file.read()
+                try:
+                    mask_pil = Image.open(io.BytesIO(mask_data)).convert("L")
+                except (UnidentifiedImageError, OSError):
+                    raise HTTPException(400, "Invalid or unsupported mask image")
+                if mask_pil.size != (img_w, img_h):
+                    mask_pil = mask_pil.resize((img_w, img_h), Image.NEAREST)
+            elif any(v is not None for v in (x, y, w, h)):
+                # Mode: bbox
+                if any(v is None for v in (x, y, w, h)):
+                    raise HTTPException(400, "bbox mode requires all four of x, y, w, h")
+                if w <= 0 or h <= 0:
+                    raise HTTPException(400, "bbox w and h must be > 0")
+                if x < 0 or y < 0 or x + w > img_w or y + h > img_h:
+                    raise HTTPException(400, "bbox extends outside the image")
+                mode = "bbox"
+                mask_pil = Image.new("L", (img_w, img_h), 0)
+                ImageDraw.Draw(mask_pil).rectangle([x, y, x + w - 1, y + h - 1], fill=255)
+            else:
+                # Mode: auto-subject (BiRefNet → invert)
+                mode = "auto-subject"
+                _rgb, subject_mask = self._get_mask(image_obj)
+                mask_arr = np.asarray(subject_mask.convert("L"), dtype=np.uint8)
+                if mask_arr.max() == 0:
+                    raise HTTPException(422, "No subject detected. Send mask or bbox.")
+                inverted_arr = 255 - mask_arr
+                mask_pil = Image.fromarray(inverted_arr, mode="L")
+
+            # Reject empty masks
+            mask_arr_check = np.asarray(mask_pil.convert("L"), dtype=np.uint8)
+            if mask_arr_check.max() == 0:
+                raise HTTPException(400, "Mask has no pixels to inpaint.")
+
+            # Warn (don't reject) if mask covers >50% of image
+            warn_header = None
+            white_frac = (mask_arr_check > 127).sum() / mask_arr_check.size
+            if white_frac > 0.5:
+                warn_header = f"mask covers {white_frac:.0%} of the image; LaMa quality degrades on very large masks"
+
+            try:
+                inpainted = self._inpaint(image_obj, mask_pil, dilation)
+            except RuntimeError as e:
+                raise HTTPException(500, f"inpaint failed: {e}")
+
+            self._bump_counter()
+            content = self._encode(inpainted, fmt)
+            headers = {
+                "x-knockout-model": "big-lama",
+                "x-knockout-mode": mode,
+            }
+            if warn_header:
+                headers["x-knockout-warning"] = warn_header
+            resp = Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt], headers=headers)
+            self._end(ctx, "/inpaint", _t)
             return resp
 
         @web.post("/studio-shot")
