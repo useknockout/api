@@ -1,6 +1,7 @@
  <div align="center">
 
   # 🥊 useknockout
+[![Open in Spaces](https://huggingface.co/datasets/huggingface/badges/raw/main/open-in-hf-spaces-md-dark.svg)](https://huggingface.co/spaces/tlorents/useknockout-demo)
 
   **State-of-the-art background removal API — open source, self-hostable, 40× cheaper than remove.bg.**
 
