@@ -43,6 +43,32 @@ MODEL_REPO = "ZhengPeng7/BiRefNet"
 MODEL_INPUT_SIZE = (1024, 1024)
 MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
 
+# --- Tier-based endpoint gating -------------------------------------------
+# Billable endpoints a signed-up FREE-tier user may call. Anything billable
+# NOT in this set requires a paid tier (payg/volume/enterprise); free callers
+# get a 402 upsell. /estimate is ungated (no auth) so it is intentionally
+# absent. Paid-only set = AI enhancement (upscale, face-restore, colorize,
+# inpaint) + e-commerce presets (studio-shot, headshot) + creative (shadow,
+# silhouette) + batch (remove-batch, remove-batch-url).
+FREE_TIER_ENDPOINTS = frozenset({
+    "/remove",
+    "/remove-url",
+    "/replace-bg",
+    "/mask",
+    "/smart-crop",
+    "/outline",
+    "/sticker",
+    "/compare",
+    "/preview",
+})
+
+# The anonymous shared demo key is a throttled taste of the product: it may
+# only hit these endpoints, output is downscaled, and there is a global daily
+# cap. Everything else 402s with a signup nudge.
+DEMO_ENDPOINTS = frozenset({"/remove"})
+DEMO_MAX_DIM = 512                 # demo output capped to this longest side
+DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP overrides
+
 # Swin2SR — SwinV2 Transformer super-res (successor to SwinIR). Apache-2.0.
 # Better than Real-ESRGAN on real photos: preserves skin/hair texture instead
 # of the painted/plastic look Real-ESRGAN produces on faces.
@@ -363,6 +389,42 @@ class Knockout:
         if not presented:
             raise HTTPException(status_code=401, detail="Empty bearer token")
 
+        # Hard-retired tokens — recognized only so we can return a helpful 402
+        # upsell instead of a generic auth error. No access. Env-driven so a
+        # leaked key can be killed without a redeploy.
+        retired = set()
+        retired_env = os.environ.get("API_TOKEN_RETIRED", "").strip()
+        if retired_env:
+            retired |= {t.strip() for t in retired_env.split(",") if t.strip()}
+        if presented in retired:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    "This key has been retired. Create a free account at "
+                    "useknockout.com/signup — 20 images/month free, no card, "
+                    "then pay-as-you-go at $0.005/image (40x cheaper than remove.bg)."
+                ),
+            )
+
+        # Anonymous shared demo key(s) — a throttled taste of the product. The
+        # old public-beta key now lands here instead of being killed: it stays
+        # the frictionless "try it in 3 seconds" hook, but downstream gating
+        # restricts it to /remove only, downscales output, and enforces a
+        # global daily cap (see _check_endpoint_access / _enforce_demo_limit).
+        # is_legacy keeps it out of the per-user usage table + monthly quota.
+        demo_keys = {"kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f"}
+        demo_env = os.environ.get("API_TOKEN_DEMO", "").strip()
+        if demo_env:
+            demo_keys |= {t.strip() for t in demo_env.split(",") if t.strip()}
+        if presented in demo_keys:
+            return {
+                "user_id": None,
+                "token_id": None,
+                "tier": "free",
+                "is_legacy": True,
+                "is_demo": True,
+            }
+
         # Path 1: legacy / public-beta token via API_TOKEN env.
         legacy_raw = os.environ.get("API_TOKEN", "").strip()
         legacy_set = {t.strip() for t in legacy_raw.split(",") if t.strip()}
@@ -439,6 +501,77 @@ class Knockout:
             "stripe_customer_id": stripe_customer_id,
             "is_legacy": False,
         }
+
+    def _check_endpoint_access(self, ctx: dict, endpoint: str) -> None:
+        """Tier-based endpoint gate.
+
+        - Demo key: /remove only (DEMO_ENDPOINTS).
+        - Signed-up free tier: blocked from paid endpoints (anything not in
+          FREE_TIER_ENDPOINTS).
+        - Internal full-access API_TOKEN (is_legacy, not demo): ungated.
+        - Paid tiers: ungated.
+        """
+        if ctx.get("is_demo"):
+            if endpoint not in DEMO_ENDPOINTS:
+                allowed = ", ".join(sorted(DEMO_ENDPOINTS))
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        f"The shared demo key only supports {allowed} (low-res). "
+                        "Create a free account at useknockout.com/signup for your "
+                        "own key — 20 full-quality images/month free across all "
+                        "core endpoints, no card."
+                    ),
+                )
+            return
+        # Internal legacy full-access token (API_TOKEN env) — not tier-gated.
+        if ctx.get("is_legacy"):
+            return
+        if ctx.get("tier") == "free" and endpoint not in FREE_TIER_ENDPOINTS:
+            raise HTTPException(
+                status_code=402,
+                detail=(
+                    f"{endpoint} is a paid endpoint. Your free tier covers the "
+                    f"{len(FREE_TIER_ENDPOINTS)} core endpoints (background "
+                    "removal + basic edits). Upgrade for AI enhancement, "
+                    "e-commerce presets & batch at useknockout.com/pricing — "
+                    "pay-as-you-go $0.005/image, no minimum."
+                ),
+            )
+
+    def _enforce_demo_limit(self, ctx: dict) -> None:
+        """Global daily cap on the anonymous shared demo key. No-op otherwise.
+
+        Soft cap: read-modify-write on a date-keyed counter in the existing
+        knockout-stats modal.Dict (no DB change). Minor overshoot under
+        concurrency is fine — this is a cost guard, not a billing meter.
+        """
+        if not ctx.get("is_demo"):
+            return
+        try:
+            cap = int(os.environ.get("DEMO_DAILY_CAP", "") or DEMO_DAILY_CAP_DEFAULT)
+        except ValueError:
+            cap = DEMO_DAILY_CAP_DEFAULT
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"demo-{day}"
+        try:
+            d = modal.Dict.from_name("knockout-stats", create_if_missing=True)
+            used = int(d.get(key, 0))
+            if used >= cap:
+                raise HTTPException(
+                    status_code=402,
+                    detail=(
+                        "The shared demo key has hit today's global free limit. "
+                        "Create a free account at useknockout.com/signup for your "
+                        "own key — 20 images/month free, no card, available now."
+                    ),
+                )
+            d[key] = used + 1
+        except HTTPException:
+            raise
+        except Exception:
+            # Never fail a real call because the counter store hiccuped.
+            pass
 
     def _check_scope(self, ctx: dict, endpoint: str) -> None:
         """If a token has scopes, deny calls to endpoints not in the list."""
@@ -523,7 +656,9 @@ class Knockout:
     def _begin(self, authorization: Optional[str], endpoint: str) -> Tuple[dict, float]:
         """One call → auth + scope + quota + start timer. Use at top of each handler."""
         ctx = self._check_auth(authorization)
+        self._check_endpoint_access(ctx, endpoint)
         self._check_scope(ctx, endpoint)
+        self._enforce_demo_limit(ctx)
         self._enforce_quota(ctx)
         return ctx, time.perf_counter()
 
@@ -586,6 +721,17 @@ class Knockout:
             return image_obj
         except (UnidentifiedImageError, OSError):
             raise HTTPException(400, "Invalid or unsupported image")
+
+    def _downscale_max(self, image_obj, max_dim: int):
+        """Downscale so the longest side is <= max_dim. Used to cap demo output."""
+        w, h = image_obj.size
+        if max(w, h) <= max_dim:
+            return image_obj
+        scale = max_dim / float(max(w, h))
+        return image_obj.resize(
+            (max(1, int(round(w * scale))), max(1, int(round(h * scale)))),
+            Image.LANCZOS,
+        )
 
     def _get_mask(self, image_obj):
         """Run BiRefNet on an RGB image, return (rgb_image, mask_pil)."""
@@ -1014,6 +1160,8 @@ class Knockout:
             data = file.file.read()
             image_obj = self._open_image(data)
             result = self._remove(image_obj)
+            if ctx.get("is_demo"):
+                result = self._downscale_max(result, DEMO_MAX_DIM)
             resp = self._response(result, fmt)
             self._end(ctx, "/remove", _t)
             return resp

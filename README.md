@@ -75,21 +75,39 @@ Input → Output:
 
 ## Quick start
 
-### Public beta token — copy, paste, try it right now
+### Try it right now — no signup
 
-During public beta, everyone shares this bearer token:
+The shared demo key works instantly, no account needed:
 
+```bash
+curl -X POST "https://useknockout--api.modal.run/remove" \
+  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -F "file=@your-image.jpg" \
+  -o out.png
 ```
-kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f
+
+The demo key is deliberately limited: **`/remove` only, low-res output, shared daily cap.** Enough to judge the quality — sign up below for full resolution and every other endpoint.
+
+### Get your own key — 20 images/month free, no card
+
+→ **[useknockout.com/signup](https://useknockout.com/signup)**
+
+- **20 full-resolution images/month free, forever** — no card needed
+- **All endpoints unlocked** — AI upscale, face restore, colorize, e-commerce presets, batch, and more
+- Then **$0.005/image** pay-as-you-go (40× cheaper than remove.bg's $0.20)
+- **$0.003/image** at 100k+/month for volume
+
+```bash
+export KNOCKOUT_TOKEN=kno_live_your_key_here
 ```
 
-No signup. Just use it. We're free during beta. Paid tier launches soon — need your own key or higher limits? DM [@useknockout](https://x.com/useknockout).
+The examples below assume `$KNOCKOUT_TOKEN` is set.
 
 ### Hit the API in 3 seconds
 
 ```bash
 curl -X POST "https://useknockout--api.modal.run/remove" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@your-image.jpg" \
   -o out.png
 ```
@@ -100,7 +118,7 @@ You get a PNG with a transparent alpha channel. Done.
 
 ```bash
 curl -X POST "https://useknockout--api.modal.run/remove-url" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"url":"https://example.com/cat.jpg"}' \
   -o out.png
@@ -111,7 +129,7 @@ curl -X POST "https://useknockout--api.modal.run/remove-url" \
 ```bash
 # solid color background
 curl -X POST "https://useknockout--api.modal.run/replace-bg" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@cat.jpg" \
   -F "bg_color=#FF5733" \
   -F "format=jpg" \
@@ -119,7 +137,7 @@ curl -X POST "https://useknockout--api.modal.run/replace-bg" \
 
 # use a remote image as the new background
 curl -X POST "https://useknockout--api.modal.run/replace-bg" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@cat.jpg" \
   -F "bg_url=https://example.com/mountains.jpg" \
   -o out.png
@@ -130,12 +148,12 @@ curl -X POST "https://useknockout--api.modal.run/replace-bg" \
 ```bash
 # multipart batch
 curl -X POST "https://useknockout--api.modal.run/remove-batch?format=png" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "files=@a.jpg" -F "files=@b.jpg" -F "files=@c.jpg"
 
 # URL batch — JSON body
 curl -X POST "https://useknockout--api.modal.run/remove-batch-url" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"urls":["https://a.jpg","https://b.jpg"], "format":"png"}'
 ```
@@ -147,37 +165,37 @@ Both return JSON: `{ "count": N, "format": "png", "results": [{ "success": true,
 ```bash
 # Sticker — cutout + thick white outline (WhatsApp / iMessage sticker style)
 curl -X POST "https://useknockout--api.modal.run/sticker" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -F "stroke_width=24" -o sticker.png
 
 # Smart crop — tight bounding box around subject
 curl -X POST "https://useknockout--api.modal.run/smart-crop" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -F "padding=32" -o cropped.png
 
 # Studio shot — e-commerce preset (white bg + shadow + centered, 1:1 aspect)
 curl -X POST "https://useknockout--api.modal.run/studio-shot" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -F "aspect=1:1" -F "format=jpg" -o studio.jpg
 
 # Shadow — subject composited onto new bg with a drop shadow
 curl -X POST "https://useknockout--api.modal.run/shadow" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -F "bg_color=#F3F4F6" -o shadow.png
 
 # Compare — before/after side-by-side for marketing/social
 curl -X POST "https://useknockout--api.modal.run/compare" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -o compare.png
 
 # Mask — just the black/white mask, for your own pipeline
 curl -X POST "https://useknockout--api.modal.run/mask" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -o mask.png
 
 # Outline — subject on transparent bg with a thin outline
 curl -X POST "https://useknockout--api.modal.run/outline" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@photo.jpg" -F "outline_color=#000000" -F "outline_width=4" -o outline.png
 ```
 
@@ -448,14 +466,14 @@ curl https://useknockout--api.modal.run/stats
 ```bash
 # default — Swin2SR (best for real photos)
 curl -X POST "https://useknockout--api.modal.run/upscale" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@small.jpg" \
   -F "scale=4" \
   -o upscaled.png
 
 # legacy — Real-ESRGAN (best for anime / illustrations)
 curl -X POST "https://useknockout--api.modal.run/upscale" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@art.png" \
   -F "scale=4" \
   -F "model=realesrgan" \
@@ -478,7 +496,7 @@ curl -X POST "https://useknockout--api.modal.run/upscale" \
 
 ```bash
 curl -X POST "https://useknockout--api.modal.run/face-restore" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@blurry-portrait.jpg" \
   -o restored.png
 ```
@@ -519,10 +537,11 @@ All endpoints apply closed-form foreground matting (via [pymatting](https://gith
 ### Python
 
 ```python
+import os
 import requests
 
 URL = "https://useknockout--api.modal.run/remove"
-TOKEN = "kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f"  # public beta token
+TOKEN = os.environ["KNOCKOUT_TOKEN"]  # get yours at useknockout.com/signup
 
 with open("input.jpg", "rb") as f:
     resp = requests.post(
@@ -753,18 +772,26 @@ Edit `main.py`:
 
 ## Pricing
 
-The hosted API at `useknockout--api.modal.run` is in **closed beta** while we validate quality. Request an API key: [contact](#contact).
-
-When the paid tier goes live:
+Sign up at **[useknockout.com/signup](https://useknockout.com/signup)** — 20 images/month free, no card.
 
 | Tier | Price | Best for |
 |---|---|---|
-| **Free** | 50 images / month, no card | Personal, eval, open source |
+| **Free** | 20 images / month, no card | Personal, eval, open source |
 | **Pay-as-you-go** | $0.005 / image | Side projects, early startups |
 | **Volume** | $0.003 / image at 100k+/mo | Production workloads |
 | **Enterprise** | Custom, private endpoints | Compliance, BYO-cloud |
 
 For reference — the same image on remove.bg is **$0.20** at their PAYG rate.
+
+**Free tier includes** all core background-removal + basic-edit endpoints:
+
+`/remove` · `/remove-url` · `/replace-bg` · `/mask` · `/smart-crop` · `/outline` · `/sticker` · `/compare` · `/preview`
+
+**Paid endpoints** (any paid tier) add AI enhancement, e-commerce presets, and batch:
+
+`/studio-shot` · `/headshot` · `/shadow` · `/silhouette` · `/upscale` · `/face-restore` · `/colorize` · `/inpaint` · `/remove-batch` · `/remove-batch-url`
+
+The anonymous demo key (no signup) is `/remove` only, low-res, with a shared daily cap. `/estimate` (pricing calculator) is free for everyone.
 
 Credits never expire. No subscriptions. You only pay for what you use.
 
