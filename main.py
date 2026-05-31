@@ -401,7 +401,7 @@ class Knockout:
                 status_code=402,
                 detail=(
                     "This key has been retired. Create a free account at "
-                    "useknockout.com/signup — 20 images/month free, no card, "
+                    "useknockout.com/signin — 20 images/month free, no card, "
                     "then pay-as-you-go at $0.005/image (40x cheaper than remove.bg)."
                 ),
             )
@@ -518,7 +518,7 @@ class Knockout:
                     status_code=402,
                     detail=(
                         f"The shared demo key only supports {allowed} (low-res). "
-                        "Create a free account at useknockout.com/signup for your "
+                        "Create a free account at useknockout.com/signin for your "
                         "own key — 20 full-quality images/month free across all "
                         "core endpoints, no card."
                     ),
@@ -562,7 +562,7 @@ class Knockout:
                     status_code=402,
                     detail=(
                         "The shared demo key has hit today's global free limit. "
-                        "Create a free account at useknockout.com/signup for your "
+                        "Create a free account at useknockout.com/signin for your "
                         "own key — 20 images/month free, no card, available now."
                     ),
                 )

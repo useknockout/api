@@ -90,7 +90,7 @@ The demo key is deliberately limited: **`/remove` only, low-res output, shared d
 
 ### Get your own key — 20 images/month free, no card
 
-→ **[useknockout.com/signup](https://useknockout.com/signup)**
+→ **[useknockout.com/signin](https://useknockout.com/signin)**
 
 - **20 full-resolution images/month free, forever** — no card needed
 - **All endpoints unlocked** — AI upscale, face restore, colorize, e-commerce presets, batch, and more
@@ -541,7 +541,7 @@ import os
 import requests
 
 URL = "https://useknockout--api.modal.run/remove"
-TOKEN = os.environ["KNOCKOUT_TOKEN"]  # get yours at useknockout.com/signup
+TOKEN = os.environ["KNOCKOUT_TOKEN"]  # get yours at useknockout.com/signin
 
 with open("input.jpg", "rb") as f:
     resp = requests.post(
@@ -772,7 +772,7 @@ Edit `main.py`:
 
 ## Pricing
 
-Sign up at **[useknockout.com/signup](https://useknockout.com/signup)** — 20 images/month free, no card.
+Sign up at **[useknockout.com/signin](https://useknockout.com/signin)** — 20 images/month free, no card.
 
 | Tier | Price | Best for |
 |---|---|---|
