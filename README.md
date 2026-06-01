@@ -27,6 +27,9 @@
 
 </div>
 
+> **Status: back up.**
+> Our API ran into a snag today and was down for a short bit. All is back on now and runs as normal. Calls go fast again. If a call did not go through today, just try it again, no action on your part. If you run this on your own box, nothing was off. Sorry for it, and thanks for staying with us.
+
 
 A production-grade background removal API powered by [BiRefNet](https://github.com/ZhengPeng7/BiRefNet) — the current SOTA on DIS5K, HRSOD, and COD benchmarks. Served on Modal's GPU infrastructure with scale-to-zero economics.
 
