@@ -27,7 +27,9 @@
 
 </div>
 
-> **Status: back up.**
+> [!IMPORTANT]
+> **Status as of 06/01/2026, 2:45 PM MST. Back up and running.**
+>
 > Our API ran into a snag today and was down for a short bit. All is back on now and runs as normal. Calls go fast again. If a call did not go through today, just try it again, no action on your part. If you run this on your own box, nothing was off. Sorry for it, and thanks for staying with us.
 
 
