@@ -1106,7 +1106,7 @@ class Knockout:
             "/outline": ("multipart 'file' + 'outline_color' + 'outline_width'", "client.outline({ file, outlineColor: '#000000' })"),
             "/silhouette": ("multipart 'file' + 'subject_color' + 'bg_color'", "client.silhouette({ file, subjectColor: '#1E2960', bgColor: '#F0857C' })"),
             "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
-            "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow'", "client.studioShot({ file, aspect: '1:1' })"),
+            "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
@@ -1580,6 +1580,7 @@ class Knockout:
             aspect: str = Form("1:1"),
             padding: int = Form(48),
             shadow: bool = Form(True),
+            transparent: bool = Form(False),
             format: str = Form("jpg"),
             authorization: Optional[str] = Header(default=None),
         ):
@@ -1587,9 +1588,14 @@ class Knockout:
             E-commerce preset — cutout → tight crop → centered on bg with shadow → standard aspect.
 
             `aspect`: "1:1", "4:5", "16:9", "3:2", or "W:H" (ints). Default 1:1.
+            `transparent`: if true, keep a transparent background (bg_color and
+                shadow are ignored). Output is forced to PNG when a non-alpha
+                format (jpg) is requested, since jpg can't carry transparency.
             """
             ctx, _t = self._begin(authorization, "/studio-shot")
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+            if transparent and fmt == "jpg":
+                fmt = "png"  # jpg can't carry alpha — coerce to a lossless alpha format
             data = file.file.read()
             image_obj = self._open_image(data)
             rgb, mask = self._get_mask(image_obj)
@@ -1632,7 +1638,12 @@ class Knockout:
             paste_x = (target_w - subject_w) // 2
             paste_y = (target_h - subject_h) // 2
 
-            if shadow:
+            if transparent:
+                # Transparent preset — centered cutout on a fully transparent
+                # canvas. No bg fill, no shadow (a shadow needs an opaque bg).
+                composed = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+                composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
+            elif shadow:
                 full_mask_for_shadow = Image.new("L", (target_w, target_h), 0)
                 full_mask_for_shadow.paste(subject_mask, (paste_x, paste_y))
                 full_cutout = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
