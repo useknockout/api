@@ -65,7 +65,13 @@ FREE_TIER_ENDPOINTS = frozenset({
 # The anonymous shared demo key is a throttled taste of the product: it may
 # only hit these endpoints, output is downscaled, and there is a global daily
 # cap. Everything else 402s with a signup nudge.
-DEMO_ENDPOINTS = frozenset({"/remove"})
+DEMO_ENDPOINTS = frozenset({
+    "/remove",
+    "/replace-bg",
+    "/mask",
+    "/sticker",
+    "/compare",
+})
 DEMO_MAX_DIM = 512                 # demo output capped to this longest side
 DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP overrides
 
@@ -1221,6 +1227,8 @@ class Knockout:
                 color = self._parse_color(bg_color)
                 composited = self._composite_on_bg(fg, color)
 
+            if ctx.get("is_demo"):
+                composited = self._downscale_max(composited, DEMO_MAX_DIM)
             resp = self._response(composited, fmt)
             self._end(ctx, "/replace-bg", _t)
             return resp
@@ -1280,7 +1288,10 @@ class Knockout:
             data = file.file.read()
             image_obj = self._open_image(data)
             _, mask = self._get_mask(image_obj)
-            resp = self._response(mask.convert("L"), fmt)
+            out = mask.convert("L")
+            if ctx.get("is_demo"):
+                out = self._downscale_max(out, DEMO_MAX_DIM)
+            resp = self._response(out, fmt)
             self._end(ctx, "/mask", _t)
             return resp
 
@@ -1407,6 +1418,8 @@ class Knockout:
             out = Image.new("RGBA", rgb.size, (0, 0, 0, 0))
             out.alpha_composite(stroke_layer)
             out.alpha_composite(subject)
+            if ctx.get("is_demo"):
+                out = self._downscale_max(out, DEMO_MAX_DIM)
             resp = self._response(out, fmt)
             self._end(ctx, "/sticker", _t)
             return resp
@@ -1593,78 +1606,96 @@ class Knockout:
                 format (jpg) is requested, since jpg can't carry transparency.
             """
             ctx, _t = self._begin(authorization, "/studio-shot")
-            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
-            if transparent and fmt == "jpg":
-                fmt = "png"  # jpg can't carry alpha — coerce to a lossless alpha format
-            data = file.file.read()
-            image_obj = self._open_image(data)
-            rgb, mask = self._get_mask(image_obj)
-
+            status_code = 200
             try:
-                aw_str, ah_str = aspect.split(":")
-                aw, ah = int(aw_str), int(ah_str)
-                if aw <= 0 or ah <= 0:
-                    raise ValueError()
+                fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+                if transparent and fmt == "jpg":
+                    fmt = "png"  # jpg can't carry alpha — coerce to a lossless alpha format
+                data = file.file.read()
+                image_obj = self._open_image(data)
+                rgb, mask = self._get_mask(image_obj)
+
+                try:
+                    aw_str, ah_str = aspect.split(":")
+                    aw, ah = int(aw_str), int(ah_str)
+                    if aw <= 0 or ah <= 0:
+                        raise ValueError()
+                except Exception:
+                    raise HTTPException(400, "aspect must be in 'W:H' format, e.g. '1:1' or '4:5'")
+
+                # Clamp aspect ratio — block extreme stretches that blow up canvas size.
+                if not (0.2 <= aw / ah <= 5.0):
+                    raise HTTPException(400, "aspect ratio must be between 1:5 and 5:1")
+
+                bbox = self._bounding_box(mask)
+                if bbox is None:
+                    raise HTTPException(400, "No subject detected in image")
+                left, top, right, bottom = bbox
+
+                clean_rgb = self._clean_foreground(rgb, mask)
+                cutout = clean_rgb.convert("RGBA")
+                cutout.putalpha(mask)
+
+                subject_w = right - left
+                subject_h = bottom - top
+                pad = max(0, min(int(padding), 2000))  # cap padding — prevents oversized canvas
+
+                # Target canvas: subject + 2*padding, padded out to aspect ratio
+                base_w = subject_w + pad * 2
+                base_h = subject_h + pad * 2
+                target_w = max(base_w, int(round(base_h * aw / ah)))
+                target_h = max(base_h, int(round(target_w * ah / aw)))
+                # Re-check W after H adjustment (keeps ratio exact)
+                if round(target_w * ah / aw) != target_h:
+                    target_w = int(round(target_h * aw / ah))
+
+                # Backstop: cap final canvas dimensions — a skinny subject + wide
+                # aspect can still multiply out past the ratio/padding clamps.
+                if target_w > 8000 or target_h > 8000:
+                    raise HTTPException(400, "Resulting canvas too large; reduce padding or use a less extreme aspect ratio")
+
+                bg_rgb = Image.new("RGB", (target_w, target_h), self._parse_color(bg_color))
+
+                subject_cut = cutout.crop((left, top, right, bottom))
+                subject_mask = mask.crop((left, top, right, bottom))
+
+                paste_x = (target_w - subject_w) // 2
+                paste_y = (target_h - subject_h) // 2
+
+                if transparent:
+                    # Transparent preset — centered cutout on a fully transparent
+                    # canvas. No bg fill, no shadow (a shadow needs an opaque bg).
+                    composed = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+                    composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
+                elif shadow:
+                    full_mask_for_shadow = Image.new("L", (target_w, target_h), 0)
+                    full_mask_for_shadow.paste(subject_mask, (paste_x, paste_y))
+                    full_cutout = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
+                    full_cutout.paste(subject_cut, (paste_x, paste_y))
+                    composed = self._composite_shadow(
+                        full_cutout,
+                        full_mask_for_shadow,
+                        bg_rgb,
+                        offset=(8, 12),
+                        blur=14,
+                        opacity=0.35,
+                        shadow_color=(0, 0, 0),
+                    )
+                else:
+                    composed = bg_rgb.convert("RGBA")
+                    composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
+                    composed = composed.convert("RGB")
+
+                resp = self._response(composed, fmt)
+                return resp
+            except HTTPException as e:
+                status_code = e.status_code
+                raise
             except Exception:
-                raise HTTPException(400, "aspect must be in 'W:H' format, e.g. '1:1' or '4:5'")
-
-            bbox = self._bounding_box(mask)
-            if bbox is None:
-                raise HTTPException(400, "No subject detected in image")
-            left, top, right, bottom = bbox
-
-            clean_rgb = self._clean_foreground(rgb, mask)
-            cutout = clean_rgb.convert("RGBA")
-            cutout.putalpha(mask)
-
-            subject_w = right - left
-            subject_h = bottom - top
-            pad = max(0, int(padding))
-
-            # Target canvas: subject + 2*padding, padded out to aspect ratio
-            base_w = subject_w + pad * 2
-            base_h = subject_h + pad * 2
-            target_w = max(base_w, int(round(base_h * aw / ah)))
-            target_h = max(base_h, int(round(target_w * ah / aw)))
-            # Re-check W after H adjustment (keeps ratio exact)
-            if round(target_w * ah / aw) != target_h:
-                target_w = int(round(target_h * aw / ah))
-
-            bg_rgb = Image.new("RGB", (target_w, target_h), self._parse_color(bg_color))
-
-            subject_cut = cutout.crop((left, top, right, bottom))
-            subject_mask = mask.crop((left, top, right, bottom))
-
-            paste_x = (target_w - subject_w) // 2
-            paste_y = (target_h - subject_h) // 2
-
-            if transparent:
-                # Transparent preset — centered cutout on a fully transparent
-                # canvas. No bg fill, no shadow (a shadow needs an opaque bg).
-                composed = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-                composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
-            elif shadow:
-                full_mask_for_shadow = Image.new("L", (target_w, target_h), 0)
-                full_mask_for_shadow.paste(subject_mask, (paste_x, paste_y))
-                full_cutout = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-                full_cutout.paste(subject_cut, (paste_x, paste_y))
-                composed = self._composite_shadow(
-                    full_cutout,
-                    full_mask_for_shadow,
-                    bg_rgb,
-                    offset=(8, 12),
-                    blur=14,
-                    opacity=0.35,
-                    shadow_color=(0, 0, 0),
-                )
-            else:
-                composed = bg_rgb.convert("RGBA")
-                composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
-                composed = composed.convert("RGB")
-
-            resp = self._response(composed, fmt)
-            self._end(ctx, "/studio-shot", _t)
-            return resp
+                status_code = 500
+                raise
+            finally:
+                self._end(ctx, "/studio-shot", _t, status_code)
 
         @web.post("/compare")
         def compare_endpoint(
@@ -1695,6 +1726,8 @@ class Knockout:
             canvas_rgba.alpha_composite(cutout, dest=(w, 0))
             canvas = canvas_rgba.convert("RGB")
 
+            if ctx.get("is_demo"):
+                canvas = self._downscale_max(canvas, DEMO_MAX_DIM)
             resp = self._response(canvas, fmt)
             self._end(ctx, "/compare", _t)
             return resp
