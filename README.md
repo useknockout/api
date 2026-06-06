@@ -14,7 +14,7 @@
   [![Python](https://img.shields.io/badge/python-3.11-3776ab?logo=python&logoColor=white)](https://python.org)
   [![TypeScript](https://img.shields.io/badge/SDK-TypeScript-3178c6?logo=typescript&logoColor=white)](https://www.npmjs.com/package/@useknockout/node)
 
-  [**Live API**](https://useknockout--api.modal.run) · [**Docs**](https://useknockout--api.modal.run/docs) · [**Quick Start**](#quick-start) · [**API Reference**](./APIREFERENCE.md) ·
+  [**Playground**](https://useknockout.com/playground) · [**Docs**](https://useknockout.com/docs) · [**Quick Start**](#quick-start) · [**API Reference**](./APIREFERENCE.md) ·
   [**Self-hosting**](./SELFHOSTING.md)
 
   <br/>
@@ -56,9 +56,13 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 
 ## Demo
 
-**Live endpoint:** `https://useknockout--api.modal.run`
+**Try it in your browser, no signup:** [useknockout.com/playground](https://useknockout.com/playground)
 
-**Interactive docs:** `https://useknockout--api.modal.run/docs`
+Drag an image in, pick an operation, get the result back. It runs the live API. Also available as a [Hugging Face Space](https://huggingface.co/spaces/tlorents/useknockout-demo).
+
+**Full docs (endpoints, SDKs, self-hosting):** [useknockout.com/docs](https://useknockout.com/docs)
+
+**Base URL (for code):** `https://useknockout--api.modal.run`
 
 Input → Output:
 
