@@ -47,17 +47,14 @@ MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
 # Billable endpoints a signed-up FREE-tier user may call. Anything billable
 # NOT in this set requires a paid tier (payg/volume/enterprise); free callers
 # get a 402 upsell. /estimate is ungated (no auth) so it is intentionally
-# absent. Paid-only set = AI enhancement (upscale, face-restore, colorize,
-# inpaint) + e-commerce presets (studio-shot, headshot) + creative (shadow,
-# silhouette) + batch (remove-batch, remove-batch-url).
+# absent. Paid-only set = edits (replace-bg, smart-crop, outline, sticker) +
+# AI enhancement (upscale, face-restore, colorize, inpaint) + e-commerce
+# presets (studio-shot, headshot) + creative (shadow, silhouette) + batch
+# (remove-batch, remove-batch-url).
 FREE_TIER_ENDPOINTS = frozenset({
     "/remove",
     "/remove-url",
-    "/replace-bg",
     "/mask",
-    "/smart-crop",
-    "/outline",
-    "/sticker",
     "/compare",
     "/preview",
 })
@@ -407,8 +404,8 @@ class Knockout:
                 status_code=402,
                 detail=(
                     "This key has been retired. Create a free account at "
-                    "useknockout.com/signin — 20 images/month free, no card, "
-                    "then pay-as-you-go at $0.005/image (40x cheaper than remove.bg)."
+                    "useknockout.com/signin — 10 images/month free, no card, "
+                    "then pay-as-you-go at $0.05/image (4x cheaper than remove.bg)."
                 ),
             )
 
@@ -525,7 +522,7 @@ class Knockout:
                     detail=(
                         f"The shared demo key only supports {allowed} (low-res). "
                         "Create a free account at useknockout.com/signin for your "
-                        "own key — 20 full-quality images/month free across all "
+                        "own key — 10 full-quality images/month free across the "
                         "core endpoints, no card."
                     ),
                 )
@@ -539,9 +536,9 @@ class Knockout:
                 detail=(
                     f"{endpoint} is a paid endpoint. Your free tier covers the "
                     f"{len(FREE_TIER_ENDPOINTS)} core endpoints (background "
-                    "removal + basic edits). Upgrade for AI enhancement, "
+                    "removal + helpers). Upgrade for edits, AI enhancement, "
                     "e-commerce presets & batch at useknockout.com/pricing — "
-                    "pay-as-you-go $0.005/image, no minimum."
+                    "pay-as-you-go $0.05/image, no minimum."
                 ),
             )
 
@@ -569,7 +566,7 @@ class Knockout:
                     detail=(
                         "The shared demo key has hit today's global free limit. "
                         "Create a free account at useknockout.com/signin for your "
-                        "own key — 20 images/month free, no card, available now."
+                        "own key — 10 images/month free, no card, available now."
                     ),
                 )
             d[key] = used + 1
@@ -591,7 +588,7 @@ class Knockout:
             )
 
     def _enforce_quota(self, ctx: dict) -> None:
-        """Free tier: 20 images/month. Paid tiers: no monthly cap."""
+        """Free tier: 10 images/month. Paid tiers: no monthly cap."""
         if ctx.get("is_legacy"):
             return
         if ctx.get("tier") != "free":
@@ -614,10 +611,10 @@ class Knockout:
                 rows = json.loads(body)
                 if rows:
                     used = int(rows[0].get("call_count") or 0)
-                    if used >= 20:
+                    if used >= 10:
                         raise HTTPException(
                             status_code=402,
-                            detail="Free tier monthly quota (20) exhausted. Upgrade at useknockout.com/pricing.",
+                            detail="Free tier monthly quota (10) exhausted. Upgrade at useknockout.com/pricing.",
                         )
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
@@ -2025,7 +2022,7 @@ class Knockout:
                 "image_pixels": px,
                 "est_latency_ms_warm": est_ms,
                 "est_latency_ms_cold": est_ms + 8000,  # ~8s cold start on L4
-                "est_cost_usd": 0.005,
+                "est_cost_usd": 0.05,
                 "free_during_beta": True,
                 "note": "warm = container already running; cold = first request after scaledown",
             }
