@@ -31,7 +31,7 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 
 - **SOTA quality** — matches or beats remove.bg, Photoroom, and Pixelcut on hair, fur, fine detail
 - **Fast** — ~200ms per image on a warm L4 GPU
-- **Cheap** — (Currently FREE) Starting June 1 ~$0.00005 per image raw compute cost (4,000x cheaper than remove.bg PAYG)
+- **Cheap** — (Currently FREE) Starting June 1 ~$0.02 per image raw compute cost (40x cheaper than remove.bg PAYG)
 - **MIT licensed** — model weights and code, commercial use OK
 - **Self-hostable** — deploy to your own Modal workspace in one command
 
@@ -96,7 +96,7 @@ The demo key is deliberately limited: **`/remove` only, low-res output, shared d
 
 - **20 full-resolution images/month free, forever** — no card needed
 - **All endpoints unlocked** — AI upscale, face restore, colorize, e-commerce presets, batch, and more
-- Then **$0.005/image** pay-as-you-go (40× cheaper than remove.bg's $0.20)
+- Then **$0.02/image** pay-as-you-go (20× cheaper than remove.bg's $0.20)
 - **$0.003/image** at 100k+/month for volume
 
 ```bash
