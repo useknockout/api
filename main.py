@@ -236,7 +236,7 @@ with image.imports():
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import Response
     from gfpgan import GFPGANer
-    from PIL import Image, ImageDraw, ImageFilter, UnidentifiedImageError
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
     from pydantic import BaseModel, HttpUrl
     from pymatting import estimate_foreground_cf, estimate_foreground_ml
     from realesrgan import RealESRGANer
@@ -721,6 +721,11 @@ class Knockout:
         try:
             image_obj = Image.open(io.BytesIO(data))
             image_obj.load()
+            # Honor EXIF orientation — phone photos store rotation as a tag
+            # instead of rotating pixels. Without this, portrait shots come
+            # out sideways. exif_transpose bakes the rotation in + strips
+            # the tag so all downstream processing sees upright pixels.
+            image_obj = ImageOps.exif_transpose(image_obj)
             return image_obj
         except (UnidentifiedImageError, OSError):
             raise HTTPException(400, "Invalid or unsupported image")
@@ -1109,7 +1114,7 @@ class Knockout:
             "/outline": ("multipart 'file' + 'outline_color' + 'outline_width'", "client.outline({ file, outlineColor: '#000000' })"),
             "/silhouette": ("multipart 'file' + 'subject_color' + 'bg_color'", "client.silhouette({ file, subjectColor: '#1E2960', bgColor: '#F0857C' })"),
             "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
-            "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
+            "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent' + 'enhance'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
@@ -1591,6 +1596,8 @@ class Knockout:
             padding: int = Form(48),
             shadow: bool = Form(True),
             transparent: bool = Form(False),
+            enhance: bool = Form(False),
+            enhance_strength: float = Form(0.15),
             format: str = Form("jpg"),
             authorization: Optional[str] = Header(default=None),
         ):
@@ -1601,6 +1608,9 @@ class Knockout:
             `transparent`: if true, keep a transparent background (bg_color and
                 shadow are ignored). Output is forced to PNG when a non-alpha
                 format (jpg) is requested, since jpg can't carry transparency.
+            `enhance`: if true, apply a subtle brightness + saturation lift to
+                the subject for ecommerce-ready output. Default off.
+            `enhance_strength`: 0.0–0.5 lift amount. Default 0.15 (subtle).
             """
             ctx, _t = self._begin(authorization, "/studio-shot")
             status_code = 200
@@ -1630,6 +1640,16 @@ class Knockout:
                 left, top, right, bottom = bbox
 
                 clean_rgb = self._clean_foreground(rgb, mask)
+
+                # Ecommerce-ready pre-pass: subtle brightness + saturation lift
+                # on the subject. Applied before alpha so it never bleeds into
+                # transparency. Saturation gets ~2x the lift of brightness since
+                # Color is perceptually gentler.
+                if enhance:
+                    strength = max(0.0, min(float(enhance_strength), 0.5))
+                    clean_rgb = ImageEnhance.Brightness(clean_rgb).enhance(1.0 + strength)
+                    clean_rgb = ImageEnhance.Color(clean_rgb).enhance(1.0 + strength * 2)
+
                 cutout = clean_rgb.convert("RGBA")
                 cutout.putalpha(mask)
 
@@ -2022,7 +2042,7 @@ class Knockout:
                 "image_pixels": px,
                 "est_latency_ms_warm": est_ms,
                 "est_latency_ms_cold": est_ms + 8000,  # ~8s cold start on L4
-                "est_cost_usd": 0.05,
+                "est_cost_usd": 0.02,
                 "free_during_beta": True,
                 "note": "warm = container already running; cold = first request after scaledown",
             }
