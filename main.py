@@ -24,6 +24,7 @@ import hashlib
 import io
 import json
 import os
+import secrets
 import time
 import urllib.error
 import urllib.parse
@@ -210,6 +211,12 @@ image = (
     # Resolution-robust Large Mask Inpainting — deterministic, no prompts.
     # Weight download (~200 MB) baked into the image below via SimpleLama() warmup.
     .pip_install("simple-lama-inpainting==0.1.2")
+    # psd-tools (MIT) for layered PSD export (format=psd). Needs >=1.11 for
+    # create_pixel_layer (real transparent layers; frompil flattens to an
+    # opaque Background). Re-pin numpy AND pillow in the same layer so psd-tools
+    # can't silently bump them (it pulls pillow 12.x + numpy 2.x otherwise) and
+    # break pymatting/PIL.
+    .pip_install("psd-tools>=1.11,<2", "numpy==1.26.4", "pillow==10.4.0")
     # basicsr 1.4.2 + facexlib import `torchvision.transforms.functional_tensor`,
     # removed in torchvision 0.17+. Patch every file in site-packages that
     # references it. Uses grep to find files (no Python import — would crash).
@@ -236,7 +243,7 @@ with image.imports():
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import Response
     from gfpgan import GFPGANer
-    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageOps, UnidentifiedImageError
+    from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, UnidentifiedImageError
     from pydantic import BaseModel, HttpUrl
     from pymatting import estimate_foreground_cf, estimate_foreground_ml
     from realesrgan import RealESRGANer
@@ -587,6 +594,27 @@ class Knockout:
                 detail=f"Token not authorized for {endpoint}",
             )
 
+    def _is_pro(self, ctx: dict) -> bool:
+        """True for Knockout Plus ('pro') and enterprise ('volume') tiers."""
+        return ctx.get("tier") in {"pro", "volume"}
+
+    def _require_pro(self, ctx: dict, feature: str = "This feature") -> None:
+        """Gate premium features behind Knockout Plus. 402 for everyone else.
+
+        Internal full-access (is_legacy) bypasses, so the owner's own key still
+        works for testing. Premium = despill, watermarks, saved presets.
+        """
+        if ctx.get("is_legacy") or self._is_pro(ctx):
+            return
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"{feature} requires Knockout Plus. Upgrade at "
+                "useknockout.com/pricing to unlock edge despill, saved presets, "
+                "custom watermarks, and PSD-included exports for $10/month."
+            ),
+        )
+
     def _enforce_quota(self, ctx: dict) -> None:
         """Free tier: 10 images/month. Paid tiers: no monthly cap."""
         if ctx.get("is_legacy"):
@@ -625,8 +653,18 @@ class Knockout:
         endpoint: str,
         status: int,
         latency_ms: int,
+        units: int = 1,
+        meter_event: Optional[str] = None,
+        skip_meter: bool = False,
     ) -> None:
-        """Insert a usage row + fire a Stripe meter event for paid tiers."""
+        """Insert a usage row + fire a Stripe meter event for paid tiers.
+
+        units: billing weight (1 = one base image).
+        meter_event: override the meter to fire (e.g. 'psd.exported' for the
+            $0.10 PSD add-on, which replaces the base image meter).
+        skip_meter: bill nothing for this call (e.g. a Plus subscriber's PSD
+            export, which is included in their flat plan).
+        """
         if ctx.get("is_legacy"):
             # Public-beta calls — don't pollute the per-user usage table.
             return
@@ -652,9 +690,10 @@ class Knockout:
         except Exception:
             pass
 
-        # 2. Stripe meter event for paid tiers
-        if 200 <= status < 300 and ctx.get("tier") in {"payg", "volume"}:
-            self._report_meter(ctx)
+        # 2. Stripe meter event for paid tiers (pro pays base per-image too —
+        #    the $10/mo unlocks features, image volume is still metered).
+        if 200 <= status < 300 and not skip_meter and ctx.get("tier") in {"payg", "volume", "pro"}:
+            self._report_meter(ctx, units=units, event_name=meter_event)
 
     def _begin(self, authorization: Optional[str], endpoint: str) -> Tuple[dict, float]:
         """One call → auth + scope + quota + start timer. Use at top of each handler."""
@@ -665,15 +704,26 @@ class Knockout:
         self._enforce_quota(ctx)
         return ctx, time.perf_counter()
 
-    def _end(self, ctx: dict, endpoint: str, start: float, status: int = 200) -> None:
-        """Use after handler finishes. Records usage row + fires Stripe meter."""
-        latency_ms = int((time.perf_counter() - start) * 1000)
-        self._log_usage(ctx, endpoint, status, latency_ms)
+    def _end(self, ctx: dict, endpoint: str, start: float, status: int = 200, units: int = 1,
+             meter_event: Optional[str] = None, skip_meter: bool = False) -> None:
+        """Use after handler finishes. Records usage row + fires Stripe meter.
 
-    def _report_meter(self, ctx: dict) -> None:
-        """Fire one Stripe meter event per successful call."""
+        units: billing weight (default 1 base image).
+        meter_event / skip_meter: see _log_usage (PSD add-on + Plus exemption).
+        """
+        latency_ms = int((time.perf_counter() - start) * 1000)
+        self._log_usage(ctx, endpoint, status, latency_ms, units=units,
+                        meter_event=meter_event, skip_meter=skip_meter)
+
+    def _report_meter(self, ctx: dict, units: int = 1, event_name: Optional[str] = None) -> None:
+        """Fire one Stripe meter event per successful call. units = billed weight.
+
+        event_name overrides the default base meter — e.g. PSD export fires its
+        own 'psd.exported' meter ($0.10) instead of the base images.processed.
+        """
         sk = os.environ.get("STRIPE_SECRET_KEY", "").strip()
-        event_name = os.environ.get("STRIPE_METER_EVENT_NAME", "images.processed").strip()
+        if not event_name:
+            event_name = os.environ.get("STRIPE_METER_EVENT_NAME", "images.processed").strip()
         customer = ctx.get("stripe_customer_id")
         if not sk or not customer:
             return
@@ -681,9 +731,13 @@ class Knockout:
             data = urllib.parse.urlencode({
                 "event_name": event_name,
                 "timestamp": int(time.time()),
-                "payload[value]": "1",
+                "payload[value]": str(max(1, int(units))),
                 "payload[stripe_customer_id]": customer,
-                "identifier": f"uk_{ctx.get('token_id') or 'na'}_{int(time.time() * 1000)}",
+                # Unique per call. token+millisecond alone collides under
+                # concurrent calls (Stripe dedupes identical identifiers →
+                # silent under-billing). Random suffix guarantees each billable
+                # call is counted exactly once.
+                "identifier": f"uk_{ctx.get('token_id') or 'na'}_{int(time.time() * 1000)}_{secrets.token_hex(4)}",
             }).encode("utf-8")
             req = urllib.request.Request(
                 "https://api.stripe.com/v1/billing/meter_events",
@@ -741,16 +795,66 @@ class Knockout:
             Image.LANCZOS,
         )
 
-    def _get_mask(self, image_obj):
-        """Run BiRefNet on an RGB image, return (rgb_image, mask_pil)."""
+    def _get_mask(self, image_obj, refine: bool = True):
+        """Run BiRefNet on an RGB image, return (rgb_image, mask_pil).
+
+        Pads the image to a square BEFORE the model's fixed 1024x1024 resize so
+        the aspect ratio is preserved. Resizing a non-square image straight to
+        1024x1024 squishes it, which wrecks thin, low-contrast boundaries (water
+        reflections, fine hair, etc). We pad to a square, infer, then crop the
+        mask back to the original frame.
+
+        refine=False skips the guided-filter edge refinement — for callers that
+        only need a region (e.g. /inpaint), where the full-res float32 filter
+        buffers are pure wasted memory + latency.
+        """
         rgb = image_obj.convert("RGB")
-        tensor = self.transform(rgb).unsqueeze(0).to("cuda").half()
+        w, h = rgb.size
+        if w != h:
+            side = max(w, h)
+            square = Image.new("RGB", (side, side), (0, 0, 0))
+            square.paste(rgb, (0, 0))
+        else:
+            side = w
+            square = rgb
+        tensor = self.transform(square).unsqueeze(0).to("cuda").half()
         with torch.no_grad():
             preds = self.model(tensor)[-1].sigmoid().cpu()
         pred = preds[0].squeeze().float()
-        mask = self.to_pil(pred).resize(rgb.size)
+        mask = self.to_pil(pred).resize((side, side))
+        if w != h:
+            mask = mask.crop((0, 0, w, h))  # drop the padded region
+        if refine:
+            mask = self._refine_alpha(rgb, mask)
         self._bump_counter()
         return rgb, mask
+
+    def _refine_alpha(self, rgb, mask, radius: int = 8, eps: float = 1e-3):
+        """Edge-aware alpha refinement via a guided filter (guide = the image).
+
+        BiRefNet masks are soft and can wander off the true boundary on thin,
+        low-contrast edges (water reflections, fine hair). A guided filter snaps
+        the alpha to real image edges. Cheap — a handful of box filters. Falls
+        back to the input mask on any failure.
+        """
+        try:
+            import cv2
+            I = np.asarray(rgb.convert("L"), dtype=np.float32) / 255.0
+            p = np.asarray(mask.convert("L"), dtype=np.float32) / 255.0
+            if I.shape != p.shape:
+                p = np.asarray(mask.convert("L").resize(rgb.size), dtype=np.float32) / 255.0
+            r = (radius, radius)
+            mean_I = cv2.boxFilter(I, -1, r)
+            mean_p = cv2.boxFilter(p, -1, r)
+            cov_Ip = cv2.boxFilter(I * p, -1, r) - mean_I * mean_p
+            var_I = cv2.boxFilter(I * I, -1, r) - mean_I * mean_I
+            a = cov_Ip / (var_I + eps)
+            b = mean_p - a * mean_I
+            q = cv2.boxFilter(a, -1, r) * I + cv2.boxFilter(b, -1, r)
+            q = np.clip(q * 255.0, 0, 255).astype(np.uint8)
+            return Image.fromarray(q, mode="L")
+        except Exception:
+            return mask
 
     def _bump_counter(self) -> None:
         """Increment public processed-image counter. Never raises."""
@@ -778,69 +882,50 @@ class Knockout:
             raise HTTPException(400, "scale must be 2 or 4")
 
         model = self.swin2sr_x4 if scale == 4 else self.swin2sr_x2
+        processor = self.swin2sr_proc_x4 if scale == 4 else self.swin2sr_proc_x2
 
         rgb = image_obj.convert("RGB")
-        src = np.asarray(rgb, dtype=np.float32) / 255.0  # H, W, 3
+        src = np.asarray(rgb, dtype=np.uint8)  # H, W, 3
         h, w, _ = src.shape
 
-        tile = 256
-        overlap = 32
-        step = tile - overlap
-        out_h, out_w = h * scale, w * scale
-        accum = np.zeros((out_h, out_w, 3), dtype=np.float32)
-        weight = np.zeros((out_h, out_w, 1), dtype=np.float32)
+        # Core-crop tiling. Run each tile WITH a halo of surrounding context, but
+        # keep only its non-overlapping CORE in the output. Cores tile exactly
+        # (no seams) and are never averaged against another tile (no smear). The
+        # old approach blended overlapping SR predictions with a window — on
+        # small images tiles overlapped almost entirely, so averaging two
+        # different model outputs across most of the frame smeared away the
+        # high-frequency detail and the result looked like a plain resize.
+        core = 192   # non-overlapping region written to the output (input px)
+        halo = 32    # context fed to the model around each core, then discarded
+        out = np.zeros((h * scale, w * scale, 3), dtype=np.uint8)
 
-        # Pre-compute 1-D triangular blend window (peak in center → seamless overlap).
-        def _blend_window(length: int, ov: int) -> np.ndarray:
-            win = np.ones(length, dtype=np.float32)
-            ramp = np.linspace(0.0, 1.0, ov, endpoint=False, dtype=np.float32)
-            win[:ov] = ramp
-            win[-ov:] = ramp[::-1]
-            return win
+        for cy in range(0, h, core):
+            for cx in range(0, w, core):
+                ch = min(core, h - cy)
+                cw = min(core, w - cx)
+                # Padded input patch = core + halo, clamped to image bounds.
+                py0, py1 = max(0, cy - halo), min(h, cy + ch + halo)
+                px0, px1 = max(0, cx - halo), min(w, cx + cw + halo)
+                patch = src[py0:py1, px0:px1, :]
 
-        # Iterate tiles. Last tile snaps to edge so we cover the right/bottom border.
-        ys = list(range(0, max(1, h - overlap), step))
-        if ys[-1] + tile < h:
-            ys.append(h - tile if h > tile else 0)
-        xs = list(range(0, max(1, w - overlap), step))
-        if xs[-1] + tile < w:
-            xs.append(w - tile if w > tile else 0)
-
-        for y in ys:
-            for x in xs:
-                ty = max(0, min(y, max(0, h - tile)))
-                tx = max(0, min(x, max(0, w - tile)))
-                tile_h = min(tile, h - ty)
-                tile_w = min(tile, w - tx)
-                tile_arr = src[ty:ty + tile_h, tx:tx + tile_w, :]
-
-                tile_pil = Image.fromarray(
-                    np.clip(tile_arr * 255.0, 0, 255).astype(np.uint8)
-                )
-                processor = self.swin2sr_proc_x4 if scale == 4 else self.swin2sr_proc_x2
-                inputs = processor(tile_pil, return_tensors="pt")
+                inputs = processor(Image.fromarray(patch), return_tensors="pt")
                 pixel_values = inputs["pixel_values"].to("cuda").half()
-
                 with torch.no_grad():
-                    output = model(pixel_values=pixel_values).reconstruction
+                    rec = model(pixel_values=pixel_values).reconstruction
 
-                # output: 1, 3, h*scale_padded, w*scale_padded — crop to expected size.
-                arr = output.squeeze(0).clamp_(0, 1).float().cpu().numpy()
-                arr = np.transpose(arr, (1, 2, 0))[: tile_h * scale, : tile_w * scale, :]
+                arr = rec.squeeze(0).clamp_(0, 1).float().cpu().numpy()
+                arr = np.transpose(arr, (1, 2, 0))
+                ph, pw = py1 - py0, px1 - px0
+                arr = arr[: ph * scale, : pw * scale, :]  # drop the model's window padding
 
-                ah, aw = arr.shape[:2]
-                ov = overlap * scale
-                wy = _blend_window(ah, min(ov, ah // 2)) if ah > ov else np.ones(ah, dtype=np.float32)
-                wx = _blend_window(aw, min(ov, aw // 2)) if aw > ov else np.ones(aw, dtype=np.float32)
-                window = (wy[:, None] * wx[None, :])[:, :, None]
+                # Crop this tile's core out of the padded SR patch, place exactly.
+                oy_in, ox_in = (cy - py0) * scale, (cx - px0) * scale
+                core_sr = arr[oy_in: oy_in + ch * scale, ox_in: ox_in + cw * scale, :]
+                oy, ox = cy * scale, cx * scale
+                out[oy: oy + ch * scale, ox: ox + cw * scale, :] = \
+                    np.clip(core_sr * 255.0, 0, 255).astype(np.uint8)
 
-                oy, ox = ty * scale, tx * scale
-                accum[oy:oy + ah, ox:ox + aw, :] += arr * window
-                weight[oy:oy + ah, ox:ox + aw, :] += window
-
-        result = accum / np.clip(weight, 1e-6, None)
-        result_u8 = np.clip(result * 255.0, 0, 255).astype(np.uint8)
-        return Image.fromarray(result_u8, mode="RGB")
+        return Image.fromarray(out, mode="RGB")
 
     def _pil_to_bgr(self, image_obj):
         """PIL Image (any mode) → contiguous BGR uint8 ndarray expected by Real-ESRGAN/GFPGAN."""
@@ -851,15 +936,24 @@ class Knockout:
         """BGR uint8 ndarray → RGB PIL Image."""
         return Image.fromarray(bgr_arr[:, :, ::-1])
 
-    def _clean_foreground(self, rgb: "Image.Image", mask: "Image.Image", *, fast: bool = False) -> "Image.Image":
+    def _clean_foreground(self, rgb: "Image.Image", mask: "Image.Image", *, fast: bool = False,
+                          strength: Optional[float] = None) -> "Image.Image":
         """
         Estimate pure foreground RGB at mask edges using closed-form matting.
-        Eliminates color spill / halo from the original background.
+        Eliminates color spill / halo from the original background (despill).
+
+        strength: 0.0-1.0 blend between raw RGB (0) and fully-despilled (1).
+            None = full despill (1.0), the default. Lets callers dial edge
+            decontamination down for speed or to preserve original edge color.
 
         Skipped when FOREGROUND_REFINE=false. Downscaled internally to keep
         compute bounded (closed-form is O(N²) but solver is sparse).
         """
         if os.environ.get("FOREGROUND_REFINE", "true").strip().lower() in {"false", "0", "no", "off"}:
+            return rgb
+
+        s = 1.0 if strength is None else max(0.0, min(float(strength), 1.0))
+        if s == 0.0:
             return rgb
 
         w, h = rgb.size
@@ -884,28 +978,73 @@ class Knockout:
             clean_img = Image.fromarray(clean_u8, mode="RGB")
             if scale < 1.0:
                 clean_img = clean_img.resize((w, h), Image.LANCZOS)
+            # Partial despill — blend matted result back toward raw RGB.
+            if s < 1.0:
+                clean_img = Image.blend(rgb.convert("RGB"), clean_img, s)
             return clean_img
         except Exception:
             # Any pymatting failure → degrade gracefully to raw RGB
             return rgb
 
-    def _remove(self, image_obj):
+    @staticmethod
+    def _despill_strength(despill):
+        """Normalize a 0-100 despill request to a 0.0-1.0 matting strength.
+        None passes through (helper applies its full-despill default)."""
+        if despill is None:
+            return None
+        return max(0.0, min(float(despill) / 100.0, 1.0))
+
+    def _remove(self, image_obj, despill=None):
         rgb, mask = self._get_mask(image_obj)
-        clean_rgb = self._clean_foreground(rgb, mask)
+        clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
         result = clean_rgb.convert("RGBA")
         result.putalpha(mask)
         return result
 
-    def _composite_on_bg(self, image_obj, bg_image_or_color):
+    def _composite_on_bg(self, image_obj, bg_image_or_color, despill=None):
         """Composite foreground onto a solid color or image background."""
         rgb, mask = self._get_mask(image_obj)
-        clean_rgb = self._clean_foreground(rgb, mask)
+        clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
         if isinstance(bg_image_or_color, tuple):
-            bg = Image.new("RGB", rgb.size, bg_image_or_color)
+            bg = bg_image_or_color  # solid color — scalar fast path in _composite_linear
         else:
             bg = bg_image_or_color.convert("RGB").resize(rgb.size, Image.LANCZOS)
-        bg.paste(clean_rgb, (0, 0), mask)
-        return bg
+        return self._composite_linear(clean_rgb, bg, mask)
+
+    _SRGB_TO_LIN_LUT = None  # lazy 256-entry uint8 sRGB -> linear float32 table
+
+    @classmethod
+    def _srgb_to_lin_lut(cls):
+        if cls._SRGB_TO_LIN_LUT is None:
+            x = np.arange(256, dtype=np.float32) / 255.0
+            cls._SRGB_TO_LIN_LUT = np.where(
+                x <= 0.04045, x / 12.92, ((x + 0.055) / 1.055) ** 2.4
+            ).astype(np.float32)
+        return cls._SRGB_TO_LIN_LUT
+
+    def _composite_linear(self, fg_rgb, bg, alpha):
+        """Alpha-composite fg over bg in LINEAR light, not gamma-encoded sRGB.
+
+        Blending in sRGB darkens semi-transparent edges, leaving a faint halo
+        ring on hair/glass/reflections. Convert to linear light, blend, convert
+        back to sRGB — the halo goes away.
+
+        `bg` is an RGB PIL image or a (r, g, b) tuple; a solid color converts
+        as 3 scalars and broadcasts, skipping a full-frame background array.
+        The uint8 -> linear step is a 256-entry LUT — no per-pixel pow() on
+        the way in; only the final linear -> sRGB pass needs real math.
+        """
+        lut = self._srgb_to_lin_lut()
+        fg = lut[np.asarray(fg_rgb.convert("RGB"))]
+        if isinstance(bg, tuple):
+            bg_lin = lut[np.asarray(bg, dtype=np.uint8)]  # shape (3,) — broadcasts
+        else:
+            bg_lin = lut[np.asarray(bg.convert("RGB"))]
+        al = (np.asarray(alpha.convert("L"), dtype=np.float32) / 255.0)[:, :, None]
+        out = fg * al + bg_lin * (1.0 - al)
+        out = np.clip(out, 0.0, 1.0)
+        out = np.where(out <= 0.0031308, out * 12.92, 1.055 * np.power(out, 1 / 2.4) - 0.055)
+        return Image.fromarray((out * 255.0).clip(0, 255).astype(np.uint8), mode="RGB")
 
     def _bounding_box(self, mask, threshold: int = 10):
         """Find tight (left, top, right, bottom) bounding box of mask pixels above threshold."""
@@ -994,35 +1133,192 @@ class Knockout:
         return out.convert("RGB") if bg.mode == "RGB" else out
 
     _FORMAT_TO_PIL = {"png": "PNG", "webp": "WEBP", "jpg": "JPEG"}
-    _FORMAT_TO_MEDIA = {"png": "image/png", "webp": "image/webp", "jpg": "image/jpeg"}
+    _FORMAT_TO_MEDIA = {
+        "png": "image/png",
+        "webp": "image/webp",
+        "jpg": "image/jpeg",
+        "psd": "image/vnd.adobe.photoshop",
+    }
 
-    def _encode(self, image_out, fmt: str) -> bytes:
+    def _encode_psd(self, image_out) -> bytes:
+        """Encode a PIL image as a layered Photoshop .psd with real transparency.
+
+        Builds an empty document then adds the cutout as a PixelLayer, so the
+        alpha is stored as layer transparency that Photoshop honors. (frompil
+        flattens to an opaque Background layer — alpha ignored — so we don't use
+        it.) Requires psd-tools >= 1.11 for create_pixel_layer.
+
+        psd-tools imported lazily — it pulls a non-trivial dependency tree we
+        only want loaded when PSD is actually requested.
+        """
+        from psd_tools import PSDImage
+        rgba = image_out.convert("RGBA")
+        w, h = rgba.size
+        psd = PSDImage.new(mode="RGB", size=(w, h), depth=8)
+        psd.create_pixel_layer(rgba, name="Cutout", top=0, left=0, opacity=255)
         buf = io.BytesIO()
-        pil_fmt = self._FORMAT_TO_PIL[fmt]
-        save_kwargs = {"optimize": True}
-        if pil_fmt == "JPEG":
-            save_kwargs["quality"] = 92
-            if image_out.mode != "RGB":
-                image_out = image_out.convert("RGB")
-        image_out.save(buf, format=pil_fmt, **save_kwargs)
+        psd.save(buf)
         return buf.getvalue()
 
-    def _response(self, image_out, fmt: str):
-        content = self._encode(image_out, fmt)
+    def _encode(self, image_out, fmt: str, quality: Optional[int] = None) -> bytes:
+        """Encode a PIL image to bytes.
+
+        quality: 1-100 for lossy formats (jpg/webp). Ignored for png (lossless)
+        and psd (raw). Defaults: jpg=92, webp=80. Higher = larger, better fidelity.
+        """
+        if fmt == "psd":
+            return self._encode_psd(image_out)
+        buf = io.BytesIO()
+        pil_fmt = self._FORMAT_TO_PIL[fmt]
+        if pil_fmt == "JPEG":
+            if image_out.mode != "RGB":
+                image_out = image_out.convert("RGB")
+            q = 92 if quality is None else max(1, min(int(quality), 100))
+            image_out.save(buf, format="JPEG", quality=q, optimize=True)
+        elif pil_fmt == "WEBP":
+            q = 80 if quality is None else max(1, min(int(quality), 100))
+            # method=4 balances encode speed vs size; carries alpha for cutouts.
+            image_out.save(buf, format="WEBP", quality=q, method=4)
+        else:  # PNG — lossless, quality knob does not apply.
+            image_out.save(buf, format="PNG", optimize=True)
+        return buf.getvalue()
+
+    def _response(self, image_out, fmt: str, quality: Optional[int] = None):
+        content = self._encode(image_out, fmt, quality=quality)
         return Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt])
+
+    def _apply_resize(self, image_obj, max_dim=None, width=None, height=None):
+        """Resize output. Precedence: explicit width/height over max_dim.
+
+        - width AND height: exact box (may change aspect).
+        - width OR height alone: that axis fixed, other scaled to keep aspect.
+        - max_dim: longest side <= max_dim, aspect preserved (down or up).
+        All dims clamped to [1, 8000]. No-op if nothing passed.
+        """
+        w, h = image_obj.size
+        if width or height:
+            if width and height:
+                tw, th = int(width), int(height)
+            elif width:
+                tw = int(width)
+                th = max(1, int(round(h * tw / w)))
+            else:
+                th = int(height)
+                tw = max(1, int(round(w * th / h)))
+            tw = max(1, min(tw, 8000))
+            th = max(1, min(th, 8000))
+            if (tw, th) == (w, h):
+                return image_obj
+            return image_obj.resize((tw, th), Image.LANCZOS)
+        if max_dim:
+            md = max(1, min(int(max_dim), 8000))
+            scale = md / float(max(w, h))
+            if scale == 1.0:
+                return image_obj
+            nw, nh = max(1, int(round(w * scale))), max(1, int(round(h * scale)))
+            return image_obj.resize((nw, nh), Image.LANCZOS)
+        return image_obj
+
+    def _apply_watermark(self, image_obj, text, opacity: float = 0.5):
+        """Overlay a text watermark in the bottom-right corner.
+
+        Auto-scales font to the image, white text + 1px dark shadow for
+        legibility on any background. opacity 0.0-1.0. No-op if text falsy.
+        """
+        if not text:
+            return image_obj
+        text = str(text)[:64]
+        orig_mode = image_obj.mode
+        base = image_obj.convert("RGBA")
+        w, h = base.size
+        font_size = max(14, int(min(w, h) * 0.04))
+        try:
+            font = ImageFont.load_default(size=font_size)
+        except TypeError:  # very old Pillow — no size arg
+            font = ImageFont.load_default()
+        layer = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(layer)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+        margin = max(8, int(min(w, h) * 0.02))
+        x = max(0, w - tw - margin)
+        y = max(0, h - th - margin)
+        a = max(0, min(int(round(float(opacity) * 255)), 255))
+        draw.text((x + 1, y + 1), text, font=font, fill=(0, 0, 0, a))
+        draw.text((x, y), text, font=font, fill=(255, 255, 255, a))
+        out = Image.alpha_composite(base, layer)
+        return out if orig_mode == "RGBA" else out.convert(orig_mode)
+
+    def _finalize(self, image_obj, fmt: str, *, quality=None, max_dim=None,
+                  width=None, height=None, watermark=None, watermark_opacity=0.5):
+        """Shared output path: resize -> watermark -> encode. Returns bytes."""
+        image_obj = self._apply_resize(image_obj, max_dim=max_dim, width=width, height=height)
+        image_obj = self._apply_watermark(image_obj, watermark, watermark_opacity)
+        return self._encode(image_obj, fmt, quality=quality)
+
+    def _finalize_response(self, image_obj, fmt: str, **kw):
+        content = self._finalize(image_obj, fmt, **kw)
+        return Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt])
+
+    # Output knobs a saved preset may set as defaults. Restricted to params
+    # whose endpoint default is None, so an explicit request value can always
+    # be told apart from "omitted" and cleanly overrides the preset.
+    _PRESET_KEYS = frozenset({"quality", "max_dim", "width", "height", "despill", "watermark"})
+
+    @staticmethod
+    def _coalesce(explicit, cfg: dict, key: str):
+        """Explicit request value wins; else fall back to the preset config."""
+        return explicit if explicit is not None else cfg.get(key)
+
+    def _apply_preset(self, ctx: dict, preset: str, params: dict) -> dict:
+        """Overlay a saved preset's defaults onto explicit request params.
+
+        `params` maps preset key -> the request's explicit value (None =
+        omitted). Only the keys the calling endpoint supports are passed in,
+        and explicit values always win. Single shared path so endpoints can't
+        drift on which keys they coalesce.
+        """
+        cfg = self._get_preset_config(ctx, preset)
+        return {k: self._coalesce(v, cfg, k) for k, v in params.items()}
+
+    def _get_preset_config(self, ctx: dict, name: str) -> dict:
+        """Fetch a user's named preset config (filtered to _PRESET_KEYS). 404 if absent."""
+        user_id = ctx.get("user_id")
+        if not user_id:
+            raise HTTPException(400, "Presets require a per-user API key")
+        status, body = self._supabase_request(
+            "GET",
+            "/rest/v1/presets",
+            params={
+                "select": "config",
+                "user_id": f"eq.{user_id}",
+                "name": f"eq.{name}",
+                "limit": "1",
+            },
+        )
+        if status != 200:
+            raise HTTPException(503, "Preset service unavailable")
+        try:
+            rows = json.loads(body) if body else []
+        except json.JSONDecodeError:
+            rows = []
+        if not rows:
+            raise HTTPException(404, f"Preset {name!r} not found")
+        cfg = rows[0].get("config") or {}
+        return {k: v for k, v in cfg.items() if k in self._PRESET_KEYS}
 
     @modal.asgi_app(label="api")
     def fastapi_app(self):
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling + colorization API.",
-            version="0.8.0",
+            version="0.9.0",
         )
 
         web.add_middleware(
             CORSMiddleware,
             allow_origins=["*"],
-            allow_methods=["POST", "GET"],
+            allow_methods=["POST", "GET", "DELETE"],
             allow_headers=["*"],
         )
 
@@ -1039,6 +1335,10 @@ class Knockout:
             width: int
             height: int
 
+        class PresetBody(BaseModel):
+            name: str
+            config: dict = {}
+
         @web.get("/")
         def root():
             return {
@@ -1047,6 +1347,7 @@ class Knockout:
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
+                    "POST /psd",
                     "POST /replace-bg",
                     "POST /remove-batch",
                     "POST /remove-batch-url",
@@ -1108,6 +1409,7 @@ class Knockout:
             "/remove-batch": ("multipart 'files' (1..10 images)", "client.removeBatch({ files: ['./a.jpg', './b.jpg'] })"),
             "/remove-batch-url": ("JSON { urls: string[1..10], format }", "client.removeBatchUrl({ urls: ['https://...'] })"),
             "/mask": ("multipart 'file' — returns grayscale alpha matte", "client.mask({ file })"),
+            "/psd": ("multipart 'file' — layered .psd export, premium add-on (2x)", "client.psd({ file, despill: 80 })"),
             "/smart-crop": ("multipart 'file' + 'padding' + 'transparent'", "client.smartCrop({ file, padding: 24 })"),
             "/shadow": ("multipart 'file' + bg/shadow color & offset params", "client.shadow({ file, shadowOffsetY: 12 })"),
             "/sticker": ("multipart 'file' + 'stroke_color' + 'stroke_width'", "client.sticker({ file, strokeWidth: 24 })"),
@@ -1118,7 +1420,7 @@ class Knockout:
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
-            "/upscale": ("multipart 'file' + 'scale' (2|4) + 'model' (swin2sr|realesrgan)", "client.upscale({ file, scale: 4 })"),
+            "/upscale": ("multipart 'file' + 'scale' (2|4) + 'model' (realesrgan[default]|swin2sr)", "client.upscale({ file, scale: 4 })"),
             "/face-restore": ("multipart 'file' + 'only_center_face' + 'bg_enhance'", "client.faceRestore({ file })"),
             "/colorize": ("multipart 'file' — DDColor grayscale→color", "client.colorize({ file })"),
         }
@@ -1157,20 +1459,116 @@ class Knockout:
                 "sdk": "client.estimate({ endpoint: 'remove', width: 1024, height: 1024 })",
             }
 
+        @web.get("/presets")
+        def list_presets(authorization: Optional[str] = Header(default=None)):
+            """List the calling user's saved presets."""
+            ctx = self._check_auth(authorization)
+            user_id = ctx.get("user_id")
+            if not user_id:
+                raise HTTPException(400, "Presets require a per-user API key")
+            status, body = self._supabase_request(
+                "GET",
+                "/rest/v1/presets",
+                params={
+                    "select": "name,config,created_at,updated_at",
+                    "user_id": f"eq.{user_id}",
+                    "order": "name",
+                },
+            )
+            if status != 200:
+                raise HTTPException(503, "Preset service unavailable")
+            try:
+                rows = json.loads(body) if body else []
+            except json.JSONDecodeError:
+                rows = []
+            return {"presets": rows}
+
+        @web.post("/presets")
+        def upsert_preset(body: PresetBody, authorization: Optional[str] = Header(default=None)):
+            """Create or update a named preset (upsert on user_id + name).
+
+            config accepts: quality, max_dim, width, height, despill, watermark.
+            Unknown keys are dropped. A preset sets defaults; explicit request
+            params always override it.
+            """
+            ctx = self._check_auth(authorization)
+            self._require_pro(ctx, "Saved presets")
+            user_id = ctx.get("user_id")
+            if not user_id:
+                raise HTTPException(400, "Presets require a per-user API key")
+            name = (body.name or "").strip()
+            if not name or len(name) > 64:
+                raise HTTPException(400, "Preset name required (1-64 chars)")
+            cfg = {k: v for k, v in (body.config or {}).items() if k in self._PRESET_KEYS}
+            status, rbody = self._supabase_request(
+                "POST",
+                "/rest/v1/presets",
+                params={"on_conflict": "user_id,name"},
+                body={"user_id": user_id, "name": name, "config": cfg, "updated_at": _now_iso()},
+                prefer="resolution=merge-duplicates,return=representation",
+            )
+            if status not in (200, 201):
+                raise HTTPException(503, "Could not save preset")
+            try:
+                rows = json.loads(rbody) if rbody else []
+            except json.JSONDecodeError:
+                rows = []
+            return {"preset": rows[0] if rows else {"name": name, "config": cfg}}
+
+        @web.delete("/presets/{name}")
+        def delete_preset(name: str, authorization: Optional[str] = Header(default=None)):
+            """Delete one of the caller's presets by name."""
+            ctx = self._check_auth(authorization)
+            user_id = ctx.get("user_id")
+            if not user_id:
+                raise HTTPException(400, "Presets require a per-user API key")
+            status, _b = self._supabase_request(
+                "DELETE",
+                "/rest/v1/presets",
+                params={"user_id": f"eq.{user_id}", "name": f"eq.{name}"},
+            )
+            if status not in (200, 204):
+                raise HTTPException(503, "Could not delete preset")
+            return {"deleted": name}
+
         @web.post("/remove")
         def remove_endpoint(
             file: UploadFile = File(...),
-            format: str = "png",
+            format: str = Form("png"),
+            quality: Optional[int] = Form(None),
+            max_dim: Optional[int] = Form(None),
+            width: Optional[int] = Form(None),
+            height: Optional[int] = Form(None),
+            despill: Optional[float] = Form(None),
+            watermark: Optional[str] = Form(None),
+            watermark_opacity: float = Form(0.5),
+            preset: Optional[str] = Form(None),
             authorization: Optional[str] = Header(default=None),
         ):
             ctx, _t = self._begin(authorization, "/remove")
+            if despill is not None or watermark or preset:
+                self._require_pro(ctx, "Premium output (despill, watermark, presets)")
+            if preset:
+                p = self._apply_preset(ctx, preset, {
+                    "quality": quality, "max_dim": max_dim, "width": width,
+                    "height": height, "despill": despill, "watermark": watermark,
+                })
+                quality, max_dim, width, height, despill, watermark = (
+                    p["quality"], p["max_dim"], p["width"], p["height"],
+                    p["despill"], p["watermark"],
+                )
             fmt = self._check_format(format)
             data = file.file.read()
             image_obj = self._open_image(data)
-            result = self._remove(image_obj)
+            result = self._remove(image_obj, despill=despill)
             if ctx.get("is_demo"):
                 result = self._downscale_max(result, DEMO_MAX_DIM)
-            resp = self._response(result, fmt)
+                # Resize params could upscale right past the demo cap — drop them.
+                max_dim = width = height = None
+            resp = self._finalize_response(
+                result, fmt, quality=quality, max_dim=max_dim, width=width,
+                height=height, watermark=watermark, watermark_opacity=watermark_opacity,
+            )
             self._end(ctx, "/remove", _t)
             return resp
 
@@ -1194,12 +1592,74 @@ class Knockout:
             self._end(ctx, "/remove-url", _t)
             return out_resp
 
+        @web.post("/psd")
+        def psd_endpoint(
+            file: UploadFile = File(...),
+            despill: Optional[float] = Form(None),
+            max_dim: Optional[int] = Form(None),
+            width: Optional[int] = Form(None),
+            height: Optional[int] = Form(None),
+            watermark: Optional[str] = Form(None),
+            watermark_opacity: float = Form(0.5),
+            preset: Optional[str] = Form(None),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Layered Photoshop (.psd) export — transparent cutout on its own layer,
+            ready to edit in Photoshop/Affinity.
+
+            Premium add-on: billed at 2x base ($0.10/image). Output is always PSD.
+            Paid tiers only. Supports despill, resize, watermark, and presets.
+            """
+            ctx, _t = self._begin(authorization, "/psd")
+            status_code = 200
+            try:
+                if despill is not None or watermark or preset:
+                    self._require_pro(ctx, "Premium output (despill, watermark, presets)")
+                if preset:
+                    p = self._apply_preset(ctx, preset, {
+                        "max_dim": max_dim, "width": width, "height": height,
+                        "despill": despill, "watermark": watermark,
+                    })
+                    max_dim, width, height, despill, watermark = (
+                        p["max_dim"], p["width"], p["height"],
+                        p["despill"], p["watermark"],
+                    )
+                data = file.file.read()
+                image_obj = self._open_image(data)
+                result = self._remove(image_obj, despill=despill)
+                return self._finalize_response(
+                    result, "psd", max_dim=max_dim, width=width, height=height,
+                    watermark=watermark, watermark_opacity=watermark_opacity,
+                )
+            except HTTPException as e:
+                status_code = e.status_code
+                raise
+            except Exception:
+                status_code = 500
+                raise
+            finally:
+                # Flat $0.10 via its own psd.exported meter (not the base image
+                # meter). Included free for Knockout Plus (tier 'pro'). Only
+                # fires on 2xx — failures aren't billed.
+                is_plus = ctx.get("tier") == "pro"
+                self._end(ctx, "/psd", _t, status_code,
+                          meter_event="psd.exported", skip_meter=is_plus)
+
         @web.post("/replace-bg")
         def replace_bg_endpoint(
             file: UploadFile = File(...),
             bg_color: str = Form("#FFFFFF"),
             bg_url: Optional[str] = Form(None),
             format: str = Form("png"),
+            quality: Optional[int] = Form(None),
+            max_dim: Optional[int] = Form(None),
+            width: Optional[int] = Form(None),
+            height: Optional[int] = Form(None),
+            despill: Optional[float] = Form(None),
+            watermark: Optional[str] = Form(None),
+            watermark_opacity: float = Form(0.5),
+            preset: Optional[str] = Form(None),
             authorization: Optional[str] = Header(default=None),
         ):
             """
@@ -1212,6 +1672,17 @@ class Knockout:
             Output is opaque (no alpha). Use `format=jpg` for smallest file size.
             """
             ctx, _t = self._begin(authorization, "/replace-bg")
+            if despill is not None or watermark or preset:
+                self._require_pro(ctx, "Premium output (despill, watermark, presets)")
+            if preset:
+                p = self._apply_preset(ctx, preset, {
+                    "quality": quality, "max_dim": max_dim, "width": width,
+                    "height": height, "despill": despill, "watermark": watermark,
+                })
+                quality, max_dim, width, height, despill, watermark = (
+                    p["quality"], p["max_dim"], p["width"], p["height"],
+                    p["despill"], p["watermark"],
+                )
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
 
             data = file.file.read()
@@ -1222,16 +1693,21 @@ class Knockout:
                     bg_resp = requests.get(bg_url, timeout=15)
                     bg_resp.raise_for_status()
                     bg = self._open_image(bg_resp.content)
-                    composited = self._composite_on_bg(fg, bg)
+                    composited = self._composite_on_bg(fg, bg, despill=despill)
                 except requests.RequestException as e:
                     raise HTTPException(400, f"Could not fetch bg_url: {e}")
             else:
                 color = self._parse_color(bg_color)
-                composited = self._composite_on_bg(fg, color)
+                composited = self._composite_on_bg(fg, color, despill=despill)
 
             if ctx.get("is_demo"):
                 composited = self._downscale_max(composited, DEMO_MAX_DIM)
-            resp = self._response(composited, fmt)
+                # Resize params could upscale right past the demo cap — drop them.
+                max_dim = width = height = None
+            resp = self._finalize_response(
+                composited, fmt, quality=quality, max_dim=max_dim, width=width,
+                height=height, watermark=watermark, watermark_opacity=watermark_opacity,
+            )
             self._end(ctx, "/replace-bg", _t)
             return resp
 
@@ -1553,7 +2029,8 @@ class Knockout:
             else:
                 # Mode: auto-subject (BiRefNet → invert)
                 mode = "auto-subject"
-                _rgb, subject_mask = self._get_mask(image_obj)
+                # Region-only use (inverted + dilated below) — skip edge refinement.
+                _rgb, subject_mask = self._get_mask(image_obj, refine=False)
                 mask_arr = np.asarray(subject_mask.convert("L"), dtype=np.uint8)
                 if mask_arr.max() == 0:
                     raise HTTPException(422, "No subject detected. Send mask or bbox.")
@@ -1599,6 +2076,14 @@ class Knockout:
             enhance: bool = Form(False),
             enhance_strength: float = Form(0.15),
             format: str = Form("jpg"),
+            quality: Optional[int] = Form(None),
+            max_dim: Optional[int] = Form(None),
+            width: Optional[int] = Form(None),
+            height: Optional[int] = Form(None),
+            despill: Optional[float] = Form(None),
+            watermark: Optional[str] = Form(None),
+            watermark_opacity: float = Form(0.5),
+            preset: Optional[str] = Form(None),
             authorization: Optional[str] = Header(default=None),
         ):
             """
@@ -1615,6 +2100,17 @@ class Knockout:
             ctx, _t = self._begin(authorization, "/studio-shot")
             status_code = 200
             try:
+                if despill is not None or watermark or preset:
+                    self._require_pro(ctx, "Premium output (despill, watermark, presets)")
+                if preset:
+                    p = self._apply_preset(ctx, preset, {
+                        "quality": quality, "max_dim": max_dim, "width": width,
+                        "height": height, "despill": despill, "watermark": watermark,
+                    })
+                    quality, max_dim, width, height, despill, watermark = (
+                        p["quality"], p["max_dim"], p["width"], p["height"],
+                        p["despill"], p["watermark"],
+                    )
                 fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
                 if transparent and fmt == "jpg":
                     fmt = "png"  # jpg can't carry alpha — coerce to a lossless alpha format
@@ -1639,7 +2135,7 @@ class Knockout:
                     raise HTTPException(400, "No subject detected in image")
                 left, top, right, bottom = bbox
 
-                clean_rgb = self._clean_foreground(rgb, mask)
+                clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
 
                 # Ecommerce-ready pre-pass: subtle brightness + saturation lift
                 # on the subject. Applied before alpha so it never bleeds into
@@ -1703,7 +2199,10 @@ class Knockout:
                     composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
                     composed = composed.convert("RGB")
 
-                resp = self._response(composed, fmt)
+                resp = self._finalize_response(
+                    composed, fmt, quality=quality, max_dim=max_dim, width=width,
+                    height=height, watermark=watermark, watermark_opacity=watermark_opacity,
+                )
                 return resp
             except HTTPException as e:
                 status_code = e.status_code
@@ -1829,7 +2328,7 @@ class Knockout:
         def upscale_endpoint(
             file: UploadFile = File(...),
             scale: int = Form(4),
-            model: str = Form("swin2sr"),
+            model: str = Form("realesrgan"),
             face_enhance: bool = Form(False),
             format: str = Form("png"),
             authorization: Optional[str] = Header(default=None),
@@ -1837,10 +2336,13 @@ class Knockout:
             """
             Super-resolution. Two backends:
 
-            - `model=swin2sr` (default, v0.6.0+): SwinV2 transformer, sharper detail
-              and natural texture on real photos. Successor to SwinIR.
-            - `model=realesrgan`: Real-ESRGAN x4plus. Better on anime / illustrations,
-              tends to produce a painted look on photos.
+            - `model=realesrgan` (default, v0.9.0+): Real-ESRGAN x4plus. Restores /
+              invents plausible detail — best "wow" on low-res or degraded photos,
+              and faster (single pass, no tiling). Slight painted look on already-
+              high-quality inputs.
+            - `model=swin2sr`: SwinV2 transformer. Faithful, no invented detail —
+              sharpens what's there without artifacts. Prefer for accuracy-sensitive
+              (product / archival) work. Conservative on heavily degraded inputs.
 
             `scale` 2 or 4. `face_enhance=true` routes through GFPGAN (Real-ESRGAN
             backend only — kept for backwards compatibility).
@@ -2019,7 +2521,7 @@ class Knockout:
             """
             LATENCY_MS_BASE = {
                 "remove": 200, "remove-url": 250, "replace-bg": 220,
-                "mask": 150, "smart-crop": 180, "shadow": 230,
+                "mask": 150, "smart-crop": 180, "shadow": 230, "psd": 260,
                 "sticker": 220, "outline": 220, "studio-shot": 280,
                 "compare": 240, "preview": 80, "headshot": 280,
                 "remove-batch": 200, "remove-batch-url": 250,

@@ -26,6 +26,15 @@ Remove the background from an uploaded image.
 | Param | Type | Default | Description |
 |---|---|---|---|
 | `format` | string | `png` | `png` (default) or `webp`. Both include alpha. |
+| `quality` | int | — | Compression quality 1–100 for `webp`. Ignored for `png` (lossless). |
+| `max_dim` | int | — | Resize so the longest side is ≤ this many px (aspect preserved). |
+| `width` / `height` | int | — | Exact resize. One alone preserves aspect; both set an exact box. |
+| `despill` | float | — | **Knockout Plus.** Edge color decontamination strength `0`–`100`. Default behavior is full despill; lower to preserve original edge color. |
+| `watermark` | string | — | **Knockout Plus.** Text watermark, bottom-right, auto-scaled. |
+| `watermark_opacity` | float | `0.5` | Watermark opacity `0.0`–`1.0`. |
+| `preset` | string | — | **Knockout Plus.** Apply a saved preset by name (see `/presets`). Explicit params override preset values. |
+
+Params marked **Knockout Plus** require a `pro`-tier key; other callers receive `402`. `quality`, `max_dim`, `width`, `height` are available on all paid tiers.
 
 **Response** — `image/png` or `image/webp` with a transparent background.
 
@@ -51,6 +60,31 @@ Fetch an image from a URL and remove its background.
 
 **Response** — same as `/remove`.
 
+### `POST /psd`
+
+Background removal exported as a **layered Photoshop `.psd`** — the cutout sits on its own transparent layer ("Cutout"), ready to edit in Photoshop, Affinity, or Photopea.
+
+Paid endpoint. Billed as a **$0.10/image add-on** (its own meter, independent of your base per-image rate). **Included free with Knockout Plus.**
+
+**Headers**
+
+| Header | Required | Description |
+|---|---|---|
+| `Authorization` | Yes | `Bearer <API_TOKEN>` (paid tier) |
+| `Content-Type` | Auto | `multipart/form-data` |
+
+**Body** — `multipart/form-data`
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | — | Image to process. Max 25 MB. |
+| `max_dim` / `width` / `height` | int | — | Resize the output (see `/remove`). |
+| `despill` | float | — | **Knockout Plus.** Edge decontamination `0`–`100`. |
+| `watermark` | string | — | **Knockout Plus.** Text watermark. |
+| `preset` | string | — | **Knockout Plus.** Apply a saved preset. |
+
+**Response** — `image/vnd.adobe.photoshop` (a `.psd` with a transparent cutout layer).
+
 ### `POST /replace-bg`
 
 Remove the background and composite the subject onto a new background — solid color or a remote image.
@@ -70,6 +104,11 @@ Remove the background and composite the subject onto a new background — solid 
 | `bg_color` | string | No (default `#FFFFFF`) | Hex color for the new background. Examples: `#000000`, `#ff5733`, `#1a73e8`. |
 | `bg_url` | string | No | Remote URL of a background image. Takes precedence over `bg_color`. |
 | `format` | string | No (default `png`) | Output format: `png`, `webp`, or `jpg` (smallest, opaque only). |
+| `quality` | int | No | Compression quality 1–100 (`jpg`/`webp`). |
+| `max_dim` / `width` / `height` | int | No | Resize the output (see `/remove`). |
+| `despill` | float | No | **Knockout Plus.** Edge decontamination `0`–`100`. |
+| `watermark` / `watermark_opacity` | string / float | No | **Knockout Plus.** Text watermark + opacity. |
+| `preset` | string | No | **Knockout Plus.** Apply a saved preset. |
 
 **Response** — `image/png`, `image/webp`, or `image/jpeg` with the subject composited onto the new background. Edges are cleaned via closed-form foreground matting (no color spill, no halo).
 
@@ -196,7 +235,25 @@ E-commerce preset: remove background → tight crop → center on solid-color ca
 | `aspect` | string | `1:1` | `W:H` format. Examples: `1:1`, `4:5`, `16:9`, `3:2`. |
 | `padding` | int | `48` | Padding around the subject in pixels. |
 | `shadow` | bool | `true` | Include a soft drop shadow. |
+| `transparent` | bool | `false` | Keep a transparent background. `bg_color` and `shadow` are ignored; output is forced to PNG. |
+| `enhance` | bool | `false` | Off by default. Set `true` for a subtle brightness + saturation lift (ecommerce-ready). Leave off for true-to-life color. |
+| `enhance_strength` | float | `0.15` | Lift amount, `0.0`–`0.5`. Only applies when `enhance=true`. |
 | `format` | string | `jpg` | `png`, `webp`, or `jpg`. |
+| `quality` | int | — | Compression quality 1–100 (`jpg`/`webp`). |
+| `max_dim` / `width` / `height` | int | — | Resize the output (see `/remove`). |
+| `despill` | float | — | **Knockout Plus.** Edge decontamination `0`–`100`. |
+| `watermark` / `watermark_opacity` | string / float | — | **Knockout Plus.** Text watermark + opacity. |
+| `preset` | string | — | **Knockout Plus.** Apply a saved preset. |
+
+### `POST /presets` · `GET /presets` · `DELETE /presets/{name}`
+
+**Knockout Plus.** Save reusable output configs and apply them by name with `preset=<name>` on `/remove`, `/replace-bg`, `/studio-shot`, and `/psd`. A preset sets defaults; any explicit param on the request overrides it.
+
+- **`POST /presets`** — create/update. JSON body `{ "name": "web-thumb", "config": { "max_dim": 800, "quality": 75, "despill": 60, "watermark": "© Brand" } }`. Config keys: `quality`, `max_dim`, `width`, `height`, `despill`, `watermark` (unknown keys dropped).
+- **`GET /presets`** — list your presets.
+- **`DELETE /presets/{name}`** — delete one.
+
+Presets are per-user (tied to your API key's account). Requires a `pro`-tier key.
 
 ### `POST /compare`
 
@@ -276,7 +333,7 @@ curl -X POST "https://useknockout--api.modal.run/upscale" \
 |---|---|---|---|
 | `file` | binary | required | Source image. |
 | `scale` | int | `4` | `2` or `4`. |
-| `model` | string | `swin2sr` | `swin2sr` (default) or `realesrgan` (legacy). |
+| `model` | string | `realesrgan` | `realesrgan` (default) restores detail — best on low-res/degraded photos. `swin2sr` is faithful (no invented detail) for accuracy-sensitive work. |
 | `face_enhance` | bool | `false` | Route through GFPGAN for facial detail. Implies Real-ESRGAN backend. |
 | `format` | string | `png` | `png`, `webp`, or `jpg`. |
 

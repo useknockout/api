@@ -1,3 +1,8 @@
+---
+project: projects/useknockout-api
+type: readme
+---
+
  <div align="center">
 
   # 🥊 useknockout

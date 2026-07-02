@@ -80,3 +80,6 @@ scratch/
 planning/
 
 SDK_PARITY.md
+# tool junk + regeneratable eval outputs
+.playwright-mcp/
+eval/cases/*/out/
