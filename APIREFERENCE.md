@@ -245,6 +245,40 @@ E-commerce preset: remove background → tight crop → center on solid-color ca
 | `watermark` / `watermark_opacity` | string / float | — | **Knockout Plus.** Text watermark + opacity. |
 | `preset` | string | — | **Knockout Plus.** Apply a saved preset. |
 
+### `POST /collage`
+
+Product collage: send 2–9 photos, each is background-removed and tight-cropped, then laid out around a main image on a solid canvas. Built for e-commerce hero images (main product + accessories).
+
+**Paid tiers only. Billed at N base-image units** (each photo is a full model pass — 9 photos = 9 × your per-image price).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `files` | binary[] | required | 2–9 images, sent as repeated `files` form fields. |
+| `main_index` | int | `0` | Which image is the hero (0-based). |
+| `main_position` | string | `BR` | Hero anchor: `TL`, `T`, `TR`, `L`, `C`, `R`, `BL`, `B`, `BR`. Hero takes ~65% of the canvas; the rest fill the remaining space in equal cells. |
+| `bg_color` | string | `#FFFFFF` | Canvas color. |
+| `aspect` | string | `1:1` | `W:H` canvas ratio (between `1:5` and `5:1`). Canvas is 1600px on the long side. |
+| `padding` | int | `24` | Padding inside each cell (px, 0–200). |
+| `format` | string | `jpg` | `png`, `webp`, or `jpg`. |
+| `quality` | int | — | Compression quality 1–100 (`jpg`/`webp`). |
+| `max_dim` | int | — | Cap the output's longest side (px). |
+| `despill` | float | — | **Knockout Plus.** Edge decontamination `0`–`100`, applied to every cutout. |
+| `watermark` / `watermark_opacity` | string / float | — | **Knockout Plus.** Text watermark + opacity. |
+| `preset` | string | — | **Knockout Plus.** Apply a saved preset (`quality`, `max_dim`, `despill`, `watermark`). |
+
+```bash
+curl -X POST "https://useknockout--api.modal.run/collage" \
+  -H "Authorization: Bearer kno_..." \
+  -F "files=@main-product.jpg" \
+  -F "files=@accessory-1.jpg" \
+  -F "files=@accessory-2.jpg" \
+  -F "files=@accessory-3.jpg" \
+  -F "main_position=BR" \
+  -o collage.jpg
+```
+
+**Use cases:** marketplace hero images (product + accessories in one shot), listing thumbnails, bundle shots.
+
 ### `POST /presets` · `GET /presets` · `DELETE /presets/{name}`
 
 **Knockout Plus.** Save reusable output configs and apply them by name with `preset=<name>` on `/remove`, `/replace-bg`, `/studio-shot`, and `/psd`. A preset sets defaults; any explicit param on the request overrides it.

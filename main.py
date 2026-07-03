@@ -1067,6 +1067,84 @@ class Knockout:
         size = radius * 2 + 1
         return mask.filter(ImageFilter.MaxFilter(size))
 
+    # ---- Collage layout ------------------------------------------------------
+
+    _COLLAGE_POSITIONS = frozenset({"TL", "T", "TR", "L", "C", "R", "BL", "B", "BR"})
+
+    @staticmethod
+    def _collage_rects(canvas_w: int, canvas_h: int, n_others: int,
+                       position: str, main_frac: float = 0.65):
+        """Deterministic collage template: a main rect + equal satellite cells.
+
+        The main image anchors at `position` and takes `main_frac` of the
+        canvas; satellites fill the leftover space in equal cells — an L-shape
+        of two strips for corner anchors, one full-length strip for edge
+        anchors, top+bottom strips for center. Fixed templates over generic
+        bin-packing: predictable, testable, and it's what the reference
+        e-commerce collages actually look like.
+
+        Returns (main_rect, [satellite_rects]) as (x0, y0, x1, y1) pixel boxes.
+        """
+        W, H = canvas_w, canvas_h
+        mw, mh = int(round(W * main_frac)), int(round(H * main_frac))
+
+        def hcells(x0, x1, y0, y1, k):  # k cells left -> right
+            cw = (x1 - x0) / k
+            return [(int(x0 + i * cw), y0, int(x0 + (i + 1) * cw), y1) for i in range(k)]
+
+        def vcells(x0, x1, y0, y1, k):  # k cells top -> bottom
+            ch = (y1 - y0) / k
+            return [(x0, int(y0 + i * ch), x1, int(y0 + (i + 1) * ch)) for i in range(k)]
+
+        p = position
+        if p in ("T", "B"):
+            main = (0, 0, W, mh) if p == "T" else (0, H - mh, W, H)
+            sy0, sy1 = (mh, H) if p == "T" else (0, H - mh)
+            return main, hcells(0, W, sy0, sy1, n_others)
+        if p in ("L", "R"):
+            main = (0, 0, mw, H) if p == "L" else (W - mw, 0, W, H)
+            sx0, sx1 = (mw, W) if p == "L" else (0, W - mw)
+            return main, vcells(sx0, sx1, 0, H, n_others)
+        if p == "C":
+            main = ((W - mw) // 2, (H - mh) // 2, (W + mw) // 2, (H + mh) // 2)
+            top_k = (n_others + 1) // 2
+            bot_k = n_others - top_k
+            cells = hcells(0, W, 0, (H - mh) // 2, top_k)
+            if bot_k:
+                cells += hcells(0, W, (H + mh) // 2, H, bot_k)
+            return main, cells
+        # Corners — satellites fill the L-shape: a full-width strip on the
+        # opposite vertical side + a column beside the main block.
+        x0 = 0 if "L" in p else W - mw
+        y0 = 0 if "T" in p else H - mh
+        main = (x0, y0, x0 + mw, y0 + mh)
+        sy0, sy1 = (mh, H) if "T" in p else (0, H - mh)      # horizontal strip
+        sx0, sx1 = (mw, W) if "L" in p else (0, W - mw)      # vertical strip
+        h_area = W * (sy1 - sy0)
+        v_area = (sx1 - sx0) * mh
+        k_h = min(n_others, max(1, round(n_others * h_area / (h_area + v_area))))
+        k_v = n_others - k_h
+        cells = hcells(0, W, sy0, sy1, k_h)
+        if k_v:
+            cells += vcells(sx0, sx1, y0, y0 + mh, k_v)
+        return main, cells
+
+    @staticmethod
+    def _fit_in_cell(cutout, cell, pad: int):
+        """Scale a cutout to fit inside `cell` minus padding, centered.
+
+        Returns (resized_image, (paste_x, paste_y)). Aspect preserved; small
+        cutouts are upscaled so cells read uniformly.
+        """
+        x0, y0, x1, y1 = cell
+        avail_w = max(8, x1 - x0 - 2 * pad)
+        avail_h = max(8, y1 - y0 - 2 * pad)
+        scale = min(avail_w / cutout.width, avail_h / cutout.height)
+        nw = max(1, int(round(cutout.width * scale)))
+        nh = max(1, int(round(cutout.height * scale)))
+        resized = cutout.resize((nw, nh), Image.LANCZOS)
+        return resized, (x0 + (x1 - x0 - nw) // 2, y0 + (y1 - y0 - nh) // 2)
+
     def _inpaint(self, image_obj, mask, dilation: int):
         """
         LaMa-based inpainting with full-resolution preservation.
@@ -1312,7 +1390,7 @@ class Knockout:
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling + colorization API.",
-            version="0.9.0",
+            version="0.10.0",
         )
 
         web.add_middleware(
@@ -1359,6 +1437,7 @@ class Knockout:
                     "POST /outline",
                     "POST /silhouette",
                     "POST /studio-shot",
+                    "POST /collage",
                     "POST /compare",
                     "POST /headshot",
                     "POST /preview",
@@ -1417,6 +1496,7 @@ class Knockout:
             "/silhouette": ("multipart 'file' + 'subject_color' + 'bg_color'", "client.silhouette({ file, subjectColor: '#1E2960', bgColor: '#F0857C' })"),
             "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
             "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent' + 'enhance'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
+            "/collage": ("multipart 'files' (2-9) + 'main_index' + 'main_position' (TL..BR|C) — paid tiers, billed N units", "client.collage({ files, mainPosition: 'BR' })"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
@@ -2212,6 +2292,113 @@ class Knockout:
                 raise
             finally:
                 self._end(ctx, "/studio-shot", _t, status_code)
+
+        @web.post("/collage")
+        def collage_endpoint(
+            files: List[UploadFile] = File(...),
+            main_index: int = Form(0),
+            main_position: str = Form("BR"),
+            bg_color: str = Form("#FFFFFF"),
+            aspect: str = Form("1:1"),
+            padding: int = Form(24),
+            format: str = Form("jpg"),
+            quality: Optional[int] = Form(None),
+            max_dim: Optional[int] = Form(None),
+            despill: Optional[float] = Form(None),
+            watermark: Optional[str] = Form(None),
+            watermark_opacity: float = Form(0.5),
+            preset: Optional[str] = Form(None),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Product collage — N photos (2-9), each background-removed and
+            tight-cropped, laid out around a main image on a solid canvas.
+
+            `files`: 2-9 images. `main_index` picks the hero (default 0 = first).
+            `main_position`: TL, T, TR, L, C, R, BL, B, BR (default BR). The main
+            image takes ~65% of the canvas at that anchor; the rest fill the
+            remaining space in equal cells.
+
+            Paid tiers only. Billed at N base-image units (each photo is a full
+            model pass).
+            """
+            ctx, _t = self._begin(authorization, "/collage")
+            status_code = 200
+            n = 1
+            try:
+                if despill is not None or watermark or preset:
+                    self._require_pro(ctx, "Premium output (despill, watermark, presets)")
+                if preset:
+                    p = self._apply_preset(ctx, preset, {
+                        "quality": quality, "max_dim": max_dim,
+                        "despill": despill, "watermark": watermark,
+                    })
+                    quality, max_dim, despill, watermark = (
+                        p["quality"], p["max_dim"], p["despill"], p["watermark"],
+                    )
+                n = len(files)
+                if not (2 <= n <= 9):
+                    raise HTTPException(400, "collage requires 2-9 images")
+                if not (0 <= main_index < n):
+                    raise HTTPException(400, f"main_index must be 0..{n - 1}")
+                pos = main_position.strip().upper()
+                if pos not in self._COLLAGE_POSITIONS:
+                    raise HTTPException(
+                        400, "main_position must be one of TL, T, TR, L, C, R, BL, B, BR")
+                fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+
+                try:
+                    aw_str, ah_str = aspect.split(":")
+                    aw, ah = int(aw_str), int(ah_str)
+                    if aw <= 0 or ah <= 0:
+                        raise ValueError()
+                except Exception:
+                    raise HTTPException(400, "aspect must be in 'W:H' format, e.g. '1:1' or '4:5'")
+                if not (0.2 <= aw / ah <= 5.0):
+                    raise HTTPException(400, "aspect ratio must be between 1:5 and 5:1")
+
+                # Canvas: 1600px on the long side at the requested aspect.
+                if aw >= ah:
+                    W, H = 1600, max(1, int(round(1600 * ah / aw)))
+                else:
+                    H, W = 1600, max(1, int(round(1600 * aw / ah)))
+                pad = max(0, min(int(padding), 200))
+
+                cutouts = []
+                for i, f in enumerate(files):
+                    img = self._open_image(f.file.read())
+                    rgb, mask = self._get_mask(img)
+                    bbox = self._bounding_box(mask)
+                    if bbox is None:
+                        raise HTTPException(400, f"No subject detected in image {i + 1} of {n}")
+                    clean = self._clean_foreground(
+                        rgb, mask, strength=self._despill_strength(despill))
+                    cut = clean.convert("RGBA")
+                    cut.putalpha(mask)
+                    cutouts.append(cut.crop(bbox))
+
+                main_cut = cutouts.pop(main_index)
+                main_rect, cells = self._collage_rects(W, H, len(cutouts), pos)
+                canvas = Image.new("RGBA", (W, H), self._parse_color(bg_color) + (255,))
+                fitted, at = self._fit_in_cell(main_cut, main_rect, pad)
+                canvas.paste(fitted, at, fitted)
+                for cut, cell in zip(cutouts, cells):
+                    fitted, at = self._fit_in_cell(cut, cell, pad)
+                    canvas.paste(fitted, at, fitted)
+
+                return self._finalize_response(
+                    canvas.convert("RGB"), fmt, quality=quality, max_dim=max_dim,
+                    watermark=watermark, watermark_opacity=watermark_opacity,
+                )
+            except HTTPException as e:
+                status_code = e.status_code
+                raise
+            except Exception:
+                status_code = 500
+                raise
+            finally:
+                # Billed at N units — each input is a full model pass.
+                self._end(ctx, "/collage", _t, status_code, units=n)
 
         @web.post("/compare")
         def compare_endpoint(
