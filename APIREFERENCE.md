@@ -279,6 +279,39 @@ curl -X POST "https://useknockout--api.modal.run/collage" \
 
 **Use cases:** marketplace hero images (product + accessories in one shot), listing thumbnails, bundle shots.
 
+### `POST /video/remove` · `GET /jobs/{job_id}` (v0.11.0)
+
+Video background removal — frame-by-frame BiRefNet with temporal alpha smoothing, async. Submit a clip, get a `job_id` back immediately, poll for the result.
+
+**Paid tiers only. Billed at $0.05 per output second** (a 10s clip = $0.50), charged on successful completion only.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | `mp4`, `mov`, `avi`, `webm`, or `mkv`. Max 30 seconds, 200MB. Frames above 1080p are downscaled for processing. |
+| `format` | string | `prores4444` | `prores4444` — MOV with a real 10-bit alpha channel (drops into DaVinci Resolve, Premiere Pro, After Effects, Final Cut; no green screen). `webm` — VP9 with alpha, for web. `mp4` — H.264, requires `bg_color` (no alpha). |
+| `bg_color` | string | — | Composite every frame onto a solid color instead of transparency. |
+| `smoothing` | int | `30` | `0`–`100` temporal alpha smoothing across frames. Kills matte flicker; lower it for fast-moving subjects. |
+
+Processing runs at the source frame rate capped at 30fps. Audio is preserved.
+
+```bash
+# 1. Submit
+curl -X POST "https://useknockout--api.modal.run/video/remove" \
+  -H "Authorization: Bearer kno_..." \
+  -F "file=@clip.mp4" \
+  -F "format=prores4444"
+# -> { "job_id": "…", "status": "queued", "seconds": 9.6, "poll": "/jobs/…" }
+
+# 2. Poll until done
+curl "https://useknockout--api.modal.run/jobs/JOB_ID" \
+  -H "Authorization: Bearer kno_..."
+# -> { "status": "done", "progress": 100, "result_url": "https://…" }  (URL valid 1h)
+```
+
+`GET /jobs/{job_id}` returns `status` (`queued` | `processing` | `done` | `error`), `progress` (0–100), and a signed `result_url` when done. Jobs are visible only to the key that created them.
+
+**Use cases:** product videos for marketplace listings, talking-head cutouts, social clips on brand backgrounds, editor pipelines needing true alpha.
+
 ### `POST /presets` · `GET /presets` · `DELETE /presets/{name}`
 
 **Knockout Plus.** Save reusable output configs and apply them by name with `preset=<name>` on `/remove`, `/replace-bg`, `/studio-shot`, and `/psd`. A preset sets defaults; any explicit param on the request overrides it.

@@ -23,9 +23,14 @@ import base64
 import hashlib
 import io
 import json
+import math
 import os
 import secrets
+import shutil
+import subprocess
+import tempfile
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -72,6 +77,16 @@ DEMO_ENDPOINTS = frozenset({
 })
 DEMO_MAX_DIM = 512                 # demo output capped to this longest side
 DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP overrides
+
+# ---- /video/remove (async jobs) ----
+VIDEO_MAX_SECONDS = 30             # hard cap per clip (paid tiers; raise per-account later)
+VIDEO_FPS_CAP = 30                 # frames processed per second of video, max
+VIDEO_MAX_BYTES = 200 * 1024 * 1024
+VIDEO_MAX_DIM = 1920               # frames downscaled to this longest side before inference
+VIDEO_UNITS_PER_SECOND = 2.5       # billed via images.processed meter: $0.05/s at the $0.02 unit
+VIDEO_BUCKET = "video-jobs"
+VIDEO_FORMATS = frozenset({"prores4444", "webm", "mp4"})
+VIDEO_INPUT_EXTS = frozenset({"mp4", "mov", "avi", "webm", "mkv"})
 
 # Swin2SR — SwinV2 Transformer super-res (successor to SwinIR). Apache-2.0.
 # Better than Real-ESRGAN on real photos: preserves skin/hair texture instead
@@ -166,7 +181,7 @@ def _download_model() -> None:
 
 image = (
     modal.Image.debian_slim(python_version="3.11")
-    .apt_install("libgl1", "libglib2.0-0")
+    .apt_install("libgl1", "libglib2.0-0", "ffmpeg")  # ffmpeg: /video/remove demux/remux (ProRes 4444, VP9 alpha)
     .pip_install(
         "torch==2.4.0",
         "torchvision==0.19.0",
@@ -268,7 +283,7 @@ app = modal.App(APP_NAME, image=image)
 @app.cls(
     gpu="L4",
     scaledown_window=300,  # keep warm 5 min between requests
-    timeout=600,
+    timeout=1800,  # video jobs run inside the class (30s @ 30fps = 900 frames)
     max_containers=10,
     secrets=[modal.Secret.from_name("knockout-secrets")],
 )
@@ -390,6 +405,65 @@ class Knockout:
             return e.code, e.read()
         except Exception:
             return 0, b""
+
+    # ---- Supabase Storage (video jobs) --------------------------------------
+
+    def _storage_request(self, method: str, path: str, data: Optional[bytes] = None,
+                         content_type: str = "application/octet-stream",
+                         timeout: int = 120) -> Tuple[int, bytes]:
+        """Raw call against Supabase Storage. Service role only, server-side."""
+        url = os.environ["SUPABASE_URL"].rstrip("/") + "/storage/v1" + path
+        headers = {
+            "apikey": os.environ["SUPABASE_SERVICE_ROLE_KEY"],
+            "Authorization": f"Bearer {os.environ['SUPABASE_SERVICE_ROLE_KEY']}",
+            "Content-Type": content_type,
+        }
+        req = urllib.request.Request(url, method=method, headers=headers, data=data)
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return r.status, r.read()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read()
+
+    def _storage_upload(self, path: str, data: bytes, content_type: str) -> None:
+        status, body = self._storage_request(
+            "POST", f"/object/{VIDEO_BUCKET}/{path}", data=data, content_type=content_type)
+        if status not in (200, 201):
+            raise RuntimeError(f"storage upload failed ({status}): {body[:200]!r}")
+
+    def _storage_download(self, path: str) -> bytes:
+        status, body = self._storage_request("GET", f"/object/{VIDEO_BUCKET}/{path}")
+        if status != 200:
+            raise RuntimeError(f"storage download failed ({status}): {body[:200]!r}")
+        return body
+
+    def _storage_signed_url(self, path: str, expires_s: int = 3600) -> str:
+        status, body = self._storage_request(
+            "POST", f"/object/sign/{VIDEO_BUCKET}/{path}",
+            data=json.dumps({"expiresIn": expires_s}).encode(),
+            content_type="application/json")
+        if status != 200:
+            raise RuntimeError(f"sign failed ({status}): {body[:200]!r}")
+        signed = json.loads(body).get("signedURL", "")
+        return os.environ["SUPABASE_URL"].rstrip("/") + "/storage/v1" + signed
+
+    def _job_update(self, job_id: str, **fields) -> None:
+        """Patch a video_jobs row. Best-effort — worker keeps going on failure."""
+        fields["updated_at"] = datetime.now(timezone.utc).isoformat()
+        try:
+            self._supabase_request(
+                "PATCH", "/rest/v1/video_jobs",
+                params={"id": f"eq.{job_id}"}, body=fields, prefer="return=minimal")
+        except Exception:
+            pass
+
+    def _job_get(self, job_id: str) -> Optional[dict]:
+        status, body = self._supabase_request(
+            "GET", "/rest/v1/video_jobs", params={"id": f"eq.{job_id}", "select": "*"})
+        if status != 200:
+            return None
+        rows = json.loads(body)
+        return rows[0] if rows else None
 
     def _check_auth(self, authorization: Optional[str]) -> dict:
         """Returns a TokenContext dict. Raises HTTPException on auth failure."""
@@ -1385,12 +1459,137 @@ class Knockout:
         cfg = rows[0].get("config") or {}
         return {k: v for k, v in cfg.items() if k in self._PRESET_KEYS}
 
+    # ---- Video background removal (async worker) -----------------------------
+
+    @modal.method()
+    def process_video_job(self, job_id: str) -> None:
+        """Async video job: demux -> per-frame BiRefNet -> temporal smoothing ->
+        composite -> remux (+audio) -> upload result -> bill.
+
+        Runs on the same warm class/GPU as the web app. Spawned by
+        POST /video/remove; progress + result land in the video_jobs row.
+        """
+        job = self._job_get(job_id)
+        if not job:
+            return
+        params = job.get("params") or {}
+        fmt = params.get("format", "prores4444")
+        bg_color = params.get("bg_color")          # None => transparent output
+        smoothing = max(0, min(int(params.get("smoothing", 30)), 100)) / 100.0
+        in_ext = params.get("in_ext", "mp4")
+
+        tmp = tempfile.mkdtemp(prefix=f"vj-{job_id[:8]}-")
+        try:
+            self._job_update(job_id, status="processing", progress=1)
+
+            # 1. Fetch input
+            src = os.path.join(tmp, f"in.{in_ext}")
+            with open(src, "wb") as f:
+                f.write(self._storage_download(f"{job_id}/in.{in_ext}"))
+
+            # 2. Probe fps (duration was validated at submit)
+            probe = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=avg_frame_rate", "-of", "json", src],
+                capture_output=True, text=True, timeout=60)
+            try:
+                num, den = json.loads(probe.stdout)["streams"][0]["avg_frame_rate"].split("/")
+                src_fps = (float(num) / float(den)) if float(den) else VIDEO_FPS_CAP
+            except Exception:
+                src_fps = VIDEO_FPS_CAP
+            fps = min(src_fps or VIDEO_FPS_CAP, VIDEO_FPS_CAP)
+
+            # 3. Demux to frames (downscaled to bound inference cost) + audio
+            frames_dir = os.path.join(tmp, "frames")
+            os.makedirs(frames_dir)
+            scale = f"scale='min({VIDEO_MAX_DIM},iw)':-2"
+            subprocess.run(
+                ["ffmpeg", "-y", "-i", src, "-vf", f"fps={fps:.3f},{scale}",
+                 os.path.join(frames_dir, "%05d.png")],
+                capture_output=True, timeout=300, check=True)
+            audio = os.path.join(tmp, "audio.m4a")
+            has_audio = subprocess.run(
+                ["ffmpeg", "-y", "-i", src, "-vn", "-acodec", "aac", audio],
+                capture_output=True, timeout=120).returncode == 0
+
+            frame_files = sorted(os.listdir(frames_dir))
+            n_frames = len(frame_files)
+            if not n_frames:
+                raise RuntimeError("no frames decoded")
+            self._job_update(job_id, frames=n_frames, progress=5)
+
+            # 4. Per-frame mask + composite. Temporal EMA on the alpha kills
+            #    frame-to-frame matte flicker (refine=False: guided filter is
+            #    too slow per-frame; EMA covers the jitter instead).
+            out_dir = os.path.join(tmp, "out")
+            os.makedirs(out_dir)
+            prev_alpha = None
+            color = self._parse_color(bg_color) if bg_color else None
+            for i, name in enumerate(frame_files):
+                frame = Image.open(os.path.join(frames_dir, name)).convert("RGB")
+                _, mask = self._get_mask(frame, refine=False)
+                a = np.asarray(mask, dtype=np.float32)
+                if prev_alpha is not None and smoothing > 0:
+                    a = (1.0 - smoothing) * a + smoothing * prev_alpha
+                prev_alpha = a
+                mask = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8), mode="L")
+                if color is not None:
+                    out = self._composite_linear(frame, color, mask)
+                    out.save(os.path.join(out_dir, name))
+                else:
+                    rgba = frame.convert("RGBA")
+                    rgba.putalpha(mask)
+                    rgba.save(os.path.join(out_dir, name))
+                if i % 30 == 0:
+                    self._job_update(job_id, progress=5 + int(85 * i / n_frames))
+
+            # 5. Remux
+            if color is not None or fmt == "mp4":
+                out_name, vcodec = "out.mp4", ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
+                content_type = "video/mp4"
+            elif fmt == "webm":
+                out_name, vcodec = "out.webm", ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "24"]
+                content_type = "video/webm"
+            else:  # prores4444 — real 10-bit alpha, drops into Resolve/Premiere/AE
+                out_name, vcodec = "out.mov", ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"]
+                content_type = "video/quicktime"
+            cmd = ["ffmpeg", "-y", "-framerate", f"{fps:.3f}",
+                   "-i", os.path.join(out_dir, "%05d.png")]
+            if has_audio:
+                cmd += ["-i", audio, "-c:a", "copy", "-shortest"]
+            cmd += vcodec + [os.path.join(tmp, out_name)]
+            subprocess.run(cmd, capture_output=True, timeout=600, check=True)
+
+            # 6. Upload result + finish
+            with open(os.path.join(tmp, out_name), "rb") as f:
+                self._storage_upload(f"{job_id}/{out_name}", f.read(), content_type)
+            self._job_update(job_id, status="done", progress=100,
+                             result_path=f"{job_id}/{out_name}")
+
+            # 7. Bill: $0.05/output-second via the base image meter
+            #    (units = ceil(seconds * 2.5) at the $0.02 unit price).
+            seconds = float(job.get("seconds") or (n_frames / fps))
+            units = max(1, math.ceil(seconds * VIDEO_UNITS_PER_SECOND))
+            status_u, body_u = self._supabase_request(
+                "GET", "/rest/v1/users",
+                params={"id": f"eq.{job['user_id']}", "select": "tier,stripe_customer_id"})
+            urow = (json.loads(body_u) or [{}])[0] if status_u == 200 else {}
+            ctx = {"user_id": job["user_id"], "token_id": job.get("token_id"),
+                   "tier": urow.get("tier", "payg"),
+                   "stripe_customer_id": urow.get("stripe_customer_id"),
+                   "is_legacy": False}
+            self._log_usage(ctx, "/video/remove", 200, 0, units=units)
+        except Exception as e:
+            self._job_update(job_id, status="error", error=str(e)[:500])
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
     @modal.asgi_app(label="api")
     def fastapi_app(self):
         web = FastAPI(
             title="useknockout",
             description="State-of-the-art background removal + upscaling + colorization API.",
-            version="0.10.0",
+            version="0.11.0",
         )
 
         web.add_middleware(
@@ -1438,6 +1637,8 @@ class Knockout:
                     "POST /silhouette",
                     "POST /studio-shot",
                     "POST /collage",
+                    "POST /video/remove",
+                    "GET /jobs/{job_id}",
                     "POST /compare",
                     "POST /headshot",
                     "POST /preview",
@@ -1497,6 +1698,7 @@ class Knockout:
             "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
             "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent' + 'enhance'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
             "/collage": ("multipart 'files' (2-9) + 'main_index' + 'main_position' (TL..BR|C) — paid tiers, billed N units", "client.collage({ files, mainPosition: 'BR' })"),
+            "/video/remove": ("multipart 'file' (mp4/mov/avi/webm/mkv, 30s max) + 'format' (prores4444|webm|mp4) + 'bg_color' + 'smoothing' — async, $0.05/s, paid tiers", "POST /video/remove -> {job_id}, then GET /jobs/{job_id}"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
@@ -2399,6 +2601,113 @@ class Knockout:
             finally:
                 # Billed at N units — each input is a full model pass.
                 self._end(ctx, "/collage", _t, status_code, units=n)
+
+        @web.post("/video/remove")
+        def video_remove_endpoint(
+            file: UploadFile = File(...),
+            format: str = Form("prores4444"),
+            bg_color: Optional[str] = Form(None),
+            smoothing: int = Form(30),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Video background removal — async. Returns a job_id immediately;
+            poll GET /jobs/{job_id} for progress and the result URL.
+
+            - `format`: prores4444 (MOV, real 10-bit alpha) | webm (VP9 alpha)
+              | mp4 (H.264 — requires bg_color, no alpha).
+            - `bg_color`: composite onto a solid color instead of transparency.
+            - `smoothing`: 0-100 temporal alpha smoothing (kills matte flicker).
+
+            Caps: 30s max, 30fps, 200MB upload, 1080p processing. Paid tiers
+            only. Billed at $0.05 per output second.
+            """
+            ctx, _t = self._begin(authorization, "/video/remove")
+            fmt = format.strip().lower()
+            if fmt not in VIDEO_FORMATS:
+                raise HTTPException(400, "format must be prores4444, webm, or mp4")
+            if fmt == "mp4" and not bg_color:
+                raise HTTPException(400, "mp4 cannot carry alpha — set bg_color or use prores4444/webm")
+            if bg_color:
+                self._parse_color(bg_color)  # validate early
+            ext = (file.filename or "").rsplit(".", 1)[-1].lower()
+            if ext not in VIDEO_INPUT_EXTS:
+                raise HTTPException(400, f"unsupported container .{ext} — use {', '.join(sorted(VIDEO_INPUT_EXTS))}")
+            data = file.file.read()
+            if len(data) > VIDEO_MAX_BYTES:
+                raise HTTPException(413, "video too large (200MB max)")
+
+            # Probe duration server-side before accepting the job.
+            with tempfile.NamedTemporaryFile(suffix=f".{ext}", delete=False) as f:
+                f.write(data)
+                probe_path = f.name
+            try:
+                probe = subprocess.run(
+                    ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                     "-of", "json", probe_path],
+                    capture_output=True, text=True, timeout=60)
+                try:
+                    seconds = float(json.loads(probe.stdout)["format"]["duration"])
+                except Exception:
+                    raise HTTPException(400, "could not read video duration — is the file valid?")
+            finally:
+                os.unlink(probe_path)
+            if seconds > VIDEO_MAX_SECONDS:
+                raise HTTPException(400, f"clip is {seconds:.1f}s — {VIDEO_MAX_SECONDS}s max for now")
+
+            job_id = str(uuid.uuid4())
+            self._storage_upload(f"{job_id}/in.{ext}", data, file.content_type or "video/mp4")
+            status, _ = self._supabase_request(
+                "POST", "/rest/v1/video_jobs",
+                body={
+                    "id": job_id,
+                    "user_id": ctx.get("user_id"),
+                    "token_id": ctx.get("token_id"),
+                    "status": "queued",
+                    "seconds": round(seconds, 2),
+                    "params": {"format": fmt, "bg_color": bg_color,
+                               "smoothing": smoothing, "in_ext": ext},
+                },
+                prefer="return=minimal")
+            if status not in (200, 201):
+                raise HTTPException(503, "could not create job")
+            Knockout().process_video_job.spawn(job_id)
+
+            est_units = max(1, math.ceil(seconds * VIDEO_UNITS_PER_SECOND))
+            # Usage row for the submit; billing happens in the worker on success.
+            self._end(ctx, "/video/remove", _t, skip_meter=True)
+            return {
+                "job_id": job_id,
+                "status": "queued",
+                "seconds": round(seconds, 2),
+                "estimated_cost_units": est_units,
+                "poll": f"/jobs/{job_id}",
+            }
+
+        @web.get("/jobs/{job_id}")
+        def job_status_endpoint(
+            job_id: str,
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """Poll a video job. Returns status/progress; result_url when done (1h signed)."""
+            ctx = self._check_auth(authorization)
+            job = self._job_get(job_id)
+            if not job:
+                raise HTTPException(404, "job not found")
+            if not ctx.get("is_legacy") and job.get("user_id") != ctx.get("user_id"):
+                raise HTTPException(404, "job not found")
+            resp = {
+                "job_id": job_id,
+                "status": job.get("status"),
+                "progress": job.get("progress", 0),
+                "seconds": job.get("seconds"),
+                "frames": job.get("frames"),
+            }
+            if job.get("status") == "done" and job.get("result_path"):
+                resp["result_url"] = self._storage_signed_url(job["result_path"])
+            if job.get("status") == "error":
+                resp["error"] = job.get("error")
+            return resp
 
         @web.post("/compare")
         def compare_endpoint(
