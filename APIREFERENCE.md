@@ -224,6 +224,35 @@ Subject on transparent background with a thin outline.
 | `outline_width` | int | `4` | Outline width in pixels (capped at 60). |
 | `format` | string | `png` | `png` or `webp`. |
 
+### `POST /silhouette` (v0.8.0)
+
+Two-tone silhouette portrait — subject filled with one solid color, background with another. Apple Music / Spotify avatar style. Use for stylized profile pictures, podcast cover art, anonymized portraits, or branding placeholders.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Foreground image. |
+| `subject_color` | string | `#7C3AED` | Fill color for the subject. |
+| `bg_color` | string | `#FFFFFF` | Fill color for the background. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+### `POST /inpaint` (v0.8.0)
+
+LaMa-based image inpainting — remove objects, people, watermarks, or the subject itself and fill the hole with plausible background. Three modes, auto-detected:
+
+1. `mask` field present → user-supplied mask (white = inpaint, black = keep)
+2. `x`,`y`,`w`,`h` fields present → bbox mode (rectangular region)
+3. Neither → auto-subject mode (BiRefNet derives the subject mask and inverts it — erases the subject, keeps the scene)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source image. |
+| `mask` | binary | — | Grayscale mask image (white = inpaint). Resized to match `file` if needed. |
+| `x` / `y` / `w` / `h` | int | — | Bbox mode: all four required together, must lie inside the image. |
+| `dilation` | int | `8` | Expand the mask by N pixels (`0`–`32`) before inpainting. Higher values reduce ghost outlines from tight masks. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+Responses include `x-knockout-mode` (`mask` \| `bbox` \| `auto-subject`) and, when the mask covers more than half the image, an `x-knockout-warning` header (LaMa quality degrades on very large masks). Auto-subject mode returns `422` if no subject is detected.
+
 ### `POST /studio-shot`
 
 E-commerce preset: remove background → tight crop → center on solid-color canvas → optional drop shadow → standardized aspect ratio.
@@ -283,13 +312,16 @@ curl -X POST "https://useknockout--api.modal.run/collage" \
 
 Video background removal — frame-by-frame BiRefNet with temporal alpha smoothing, async. Submit a clip, get a `job_id` back immediately, poll for the result.
 
-**Paid tiers only. Billed at $0.05 per output second** (a 10s clip = $0.50), charged on successful completion only.
+**Paid tiers only. Billed at $0.10 per output second** ($0.08 on Knockout Plus — a 10s clip = $1.00 / $0.80), charged on successful completion only. Billing is on *output* seconds, so `speed=2` halves the cost.
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `file` | binary | required | `mp4`, `mov`, `avi`, `webm`, or `mkv`. Max 15 seconds, 200MB. Frames above 1080p are downscaled for processing. |
-| `format` | string | `prores4444` | `prores4444` — MOV with a real 10-bit alpha channel (drops into DaVinci Resolve, Premiere Pro, After Effects, Final Cut; no green screen). `webm` — VP9 with alpha, for web. `mp4` — H.264, requires `bg_color` (no alpha). |
-| `bg_color` | string | — | Composite every frame onto a solid color instead of transparency. |
+| `file` | binary | required | `mp4`, `mov`, `avi`, `webm`, or `mkv`. Max 15 seconds, 200MB. Frames above 1920px are downscaled for processing. |
+| `format` | string | `prores4444` | `prores4444` — MOV with a real 10-bit alpha channel (drops into DaVinci Resolve, Premiere Pro, After Effects, Final Cut; no green screen). `webm` — VP9 with alpha, for web. `mp4` — H.264, requires an opaque background (no alpha). |
+| `bg_color` | string | — | Composite every frame onto a solid hex color instead of transparency. |
+| `bg_image` | binary | — | Composite every frame onto an uploaded backdrop image. Precedence: `bg_image` > `bg_blur` > `bg_color` > transparent. |
+| `bg_blur` | int | `0` | `1`–`100`: composite onto a blurred copy of the source frame (portrait-mode look). |
+| `speed` | float | `1.0` | `0.25`–`4.0` output speed multiplier. Audio is tempo-shifted to match. |
 | `smoothing` | int | `30` | `0`–`100` temporal alpha smoothing across frames. Kills matte flicker; lower it for fast-moving subjects. |
 
 Processing runs at the source frame rate capped at 30fps. Audio is preserved.
@@ -373,26 +405,26 @@ Public stats — total images processed, last-24h count, last-7d trend. Powered 
 curl https://useknockout--api.modal.run/stats
 ```
 
-### `POST /upscale` (v0.6.0)
+### `POST /upscale` (v0.6.0, backend default changed v0.9.0)
 
-**Swin2SR / Real-ESRGAN x2/x4 super-resolution.** Takes blurry/small images, outputs 2x or 4x larger with AI-restored detail. Not pixel stretching — invents plausible texture.
+**Real-ESRGAN / Swin2SR x2/x4 super-resolution.** Takes blurry/small images, outputs 2x or 4x larger with AI-restored detail. Not pixel stretching — invents plausible texture.
 
-**v0.6.0** — default backend switched to **Swin2SR** (SwinV2 Transformer, successor to SwinIR). Sharper detail and more natural texture on real photos compared to Real-ESRGAN, which tends to produce a painted / plastic look on faces. Real-ESRGAN remains available via `model=realesrgan` and is still the better choice for anime / illustrations.
+**v0.9.0** — default backend is **Real-ESRGAN x4plus**: restores and invents plausible detail, best "wow" on low-res or degraded photos, and faster (single pass, no tiling). **Swin2SR** (SwinV2 Transformer) remains available via `model=swin2sr`: faithful, no invented detail — prefer it for accuracy-sensitive product or archival work.
 
 ```bash
-# default — Swin2SR (best for real photos)
+# default — Real-ESRGAN (best on low-res / degraded photos)
 curl -X POST "https://useknockout--api.modal.run/upscale" \
   -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
   -F "file=@small.jpg" \
   -F "scale=4" \
   -o upscaled.png
 
-# legacy — Real-ESRGAN (best for anime / illustrations)
+# Swin2SR (faithful — best for product / archival accuracy)
 curl -X POST "https://useknockout--api.modal.run/upscale" \
   -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
-  -F "file=@art.png" \
+  -F "file=@product.jpg" \
   -F "scale=4" \
-  -F "model=realesrgan" \
+  -F "model=swin2sr" \
   -o upscaled.png
 ```
 
@@ -424,6 +456,24 @@ curl -X POST "https://useknockout--api.modal.run/face-restore" \
 
 **Use cases:** old family photos, Zoom screenshots, dating app pics, restore CCTV stills.
 
+### `POST /colorize` (v0.8.0)
+
+**DDColor** colorization for black-and-white or grayscale photos. ConvNeXt-Large backbone predicts color in LAB space — single feed-forward pass, ~500ms warm. Color inputs are accepted too (treated as grayscale internally).
+
+```bash
+curl -X POST "https://useknockout--api.modal.run/colorize" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
+  -F "file=@bw-photo.jpg" \
+  -o colorized.png
+```
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `file` | binary | required | Source image. |
+| `format` | string | `png` | `png`, `webp`, or `jpg`. |
+
+**Use cases:** restore old family photos, colorize archival/historical images, stylize scans.
+
 ### `GET /health`
 
 Returns `{"status":"ok","model":"ZhengPeng7/BiRefNet"}`. No auth required.
@@ -438,8 +488,11 @@ Interactive OpenAPI (Swagger) UI.
 |---|---|
 | `400` | Invalid image, missing field, malformed URL, invalid hex color, or batch > 10 items |
 | `401` | Missing `Authorization` header |
+| `402` | Tier limit: free tier hitting a paid endpoint, free monthly quota (10) exhausted, non-Plus key using a Plus param, or demo key limits |
 | `403` | Invalid bearer token |
-| `413` | Image exceeds 25 MB limit |
+| `404` | Unknown `job_id` on `GET /jobs/{job_id}` |
+| `413` | Image exceeds 25 MB limit (200 MB for video) |
+| `422` | `/inpaint` auto-subject mode found no subject |
 | `500` | Server error (check dashboard logs) |
 
 ### Edge quality

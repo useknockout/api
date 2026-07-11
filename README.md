@@ -8,7 +8,7 @@ type: readme
   # 🥊 useknockout
 [![Open in Spaces](https://huggingface.co/datasets/huggingface/badges/raw/main/open-in-hf-spaces-md-dark.svg)](https://huggingface.co/spaces/tlorents/useknockout-demo)
 
-  **State-of-the-art background removal API — open source, self-hostable, 40× cheaper than remove.bg.**
+  **State-of-the-art background removal API for images and video — open source, self-hostable, 10× cheaper than remove.bg.**
 
   [![MIT License](https://img.shields.io/badge/license-MIT-3da639)](./LICENSE)
   [![npm version](https://img.shields.io/npm/v/@useknockout/node?color=cb3837)](https://www.npmjs.com/package/@useknockout/node)
@@ -36,7 +36,9 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 
 - **SOTA quality** — matches or beats remove.bg, Photoroom, and Pixelcut on hair, fur, fine detail
 - **Fast** — ~200ms per image on a warm L4 GPU
-- **Cheap** — (Currently FREE) Starting June 1 ~$0.02 per image raw compute cost (40x cheaper than remove.bg PAYG)
+- **Cheap** — $0.02 per image pay-as-you-go (10x cheaper than remove.bg PAYG)
+- **Video too** — async video background removal with ProRes 4444 alpha output ($0.10/output-second)
+- **26 endpoints** — cutouts, masks, PSD export, upscale, face restore, inpaint, collage, studio shots, and more
 - **MIT licensed** — model weights and code, commercial use OK
 - **Self-hostable** — deploy to your own Modal workspace in one command
 
@@ -93,15 +95,14 @@ curl -X POST "https://useknockout--api.modal.run/remove" \
   -o out.png
 ```
 
-The demo key is deliberately limited: **`/remove` only, low-res output, shared daily cap.** Enough to judge the quality — sign up below for full resolution and every other endpoint.
+The demo key is deliberately limited: **`/remove`, `/replace-bg`, `/mask`, `/sticker`, `/compare` only, 512px output, shared daily cap.** Enough to judge the quality — sign up below for full resolution and every other endpoint.
 
-### Get your own key — 20 images/month free, no card
+### Get your own key — 10 images/month free, no card
 
 → **[useknockout.com/signin](https://useknockout.com/signin)**
 
-- **20 full-resolution images/month free, forever** — no card needed
-- **All endpoints unlocked** — AI upscale, face restore, colorize, e-commerce presets, batch, and more
-- Then **$0.02/image** pay-as-you-go (20× cheaper than remove.bg's $0.20)
+- **10 full-resolution images/month free, forever** — no card needed
+- Pay-as-you-go at **$0.02/image** unlocks all endpoints — AI upscale, face restore, colorize, e-commerce presets, batch, video, and more (10× cheaper than remove.bg's $0.20)
 - **$0.003/image** at 100k+/month for volume
 
 ```bash
@@ -206,6 +207,44 @@ curl -X POST "https://useknockout--api.modal.run/outline" \
   -F "file=@photo.jpg" -F "outline_color=#000000" -F "outline_width=4" -o outline.png
 ```
 
+### New in v0.9–v0.11 — upscale, PSD, collage, video
+
+```bash
+# AI upscale — Real-ESRGAN super-resolution (2x/4x)
+curl -X POST "https://useknockout--api.modal.run/upscale" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
+  -F "file=@photo.jpg" -F "scale=4" -o upscaled.png
+
+# PSD export — layered Photoshop file (subject + background layers)
+curl -X POST "https://useknockout--api.modal.run/psd" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
+  -F "file=@photo.jpg" -o out.psd
+
+# Collage — 2-9 photos, each cut out and laid out around a hero image
+curl -X POST "https://useknockout--api.modal.run/collage" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
+  -F "files=@main.jpg" -F "files=@b.jpg" -F "files=@c.jpg" \
+  -F "main_position=BR" -F "aspect=1:1" -o collage.jpg
+```
+
+### Video background removal (async)
+
+Removes the background from a clip (up to 15s) and returns ProRes 4444 with a real alpha channel — or WebM/MP4 composited onto a color, image, or blur.
+
+```bash
+# submit the job
+curl -X POST "https://useknockout--api.modal.run/video/remove" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN" \
+  -F "file=@clip.mp4" -F "format=prores4444"
+# -> {"job_id": "..."}
+
+# poll until done, then download
+curl "https://useknockout--api.modal.run/jobs/JOB_ID" \
+  -H "Authorization: Bearer $KNOCKOUT_TOKEN"
+```
+
+Billed at $0.10 per output second ($0.08 on Knockout Plus). Paid tiers only.
+
 ### Health check
 
 ```bash
@@ -217,7 +256,7 @@ curl https://useknockout--api.modal.run/health
 
 ## API reference
 
-The full endpoint-by-endpoint reference for all 20 endpoints, plus client examples for Python, Node.js, Go, and browser/TypeScript, lives in a dedicated doc:
+The full endpoint-by-endpoint reference for all 26 endpoints, plus client examples for Python, Node.js, Go, and browser/TypeScript, lives in a dedicated doc:
 
 → **[API reference & client examples](./APIREFERENCE.md)**
 
@@ -270,7 +309,7 @@ Run your own instance on Modal in one command. Full prerequisites, deploy steps,
                                 └───────────────────────────┘
 ```
 
-- **One file** (`main.py`), single Modal class, two endpoints + health + docs
+- **One file** (`main.py`), single Modal class, 26 endpoints + auto-generated docs
 - **Weights baked into image** at build time — cold starts are just image pull + GPU model load (~25 s)
 - **FastAPI** handles multipart, JSON, CORS, OpenAPI schema generation
 
@@ -278,28 +317,31 @@ Run your own instance on Modal in one command. Full prerequisites, deploy steps,
 
 ## Pricing
 
-Sign up at **[useknockout.com/signin](https://useknockout.com/signin)** — 20 images/month free, no card.
+Sign up at **[useknockout.com/signin](https://useknockout.com/signin)** — 10 images/month free, no card.
 
 | Tier | Price | Best for |
 |---|---|---|
-| **Free** | 20 images / month, no card | Personal, eval, open source |
-| **Pay-as-you-go** | $0.005 / image | Side projects, early startups |
+| **Free** | 10 images / month, no card | Personal, eval, open source |
+| **Pay-as-you-go** | $0.02 / image | Side projects, early startups |
+| **Knockout Plus** | $10 / month, 250 images included, then $0.02 | Regular use + premium features |
 | **Volume** | $0.003 / image at 100k+/mo | Production workloads |
 | **Enterprise** | Custom, private endpoints | Compliance, BYO-cloud |
 
+Add-ons: **PSD export** $0.10/image · **Video** $0.10 per output second ($0.08 on Plus).
+
 For reference — the same image on remove.bg is **$0.20** at their PAYG rate.
 
-**Free tier includes** all core background-removal + basic-edit endpoints:
+**Free tier includes** the core background-removal endpoints:
 
-`/remove` · `/remove-url` · `/replace-bg` · `/mask` · `/smart-crop` · `/outline` · `/sticker` · `/compare` · `/preview`
+`/remove` · `/remove-url` · `/mask` · `/compare` · `/preview`
 
-**Paid endpoints** (any paid tier) add AI enhancement, e-commerce presets, and batch:
+**Paid endpoints** (any paid tier) add edits, AI enhancement, e-commerce presets, batch, and video:
 
-`/studio-shot` · `/headshot` · `/shadow` · `/silhouette` · `/upscale` · `/face-restore` · `/colorize` · `/inpaint` · `/remove-batch` · `/remove-batch-url`
+`/replace-bg` · `/smart-crop` · `/outline` · `/sticker` · `/shadow` · `/silhouette` · `/studio-shot` · `/headshot` · `/collage` · `/upscale` · `/face-restore` · `/colorize` · `/inpaint` · `/psd` · `/remove-batch` · `/remove-batch-url` · `/video/remove`
 
-The anonymous demo key (no signup) is `/remove` only, low-res, with a shared daily cap. `/estimate` (pricing calculator) is free for everyone.
+**Knockout Plus** additionally unlocks layered PSD at a flat rate, edge despill, saved presets (`/presets`), custom watermarks, resizing, and compression control across all endpoints.
 
-Credits never expire. No subscriptions. You only pay for what you use.
+The anonymous demo key (no signup) covers `/remove`, `/replace-bg`, `/mask`, `/sticker`, and `/compare` at 512px with a shared daily cap. `/estimate` (pricing calculator) is free for everyone.
 
 ---
 
