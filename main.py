@@ -1478,6 +1478,9 @@ class Knockout:
         params = job.get("params") or {}
         fmt = params.get("format", "prores4444")
         bg_color = params.get("bg_color")          # None => transparent output
+        bg_blur = max(0, min(int(params.get("bg_blur", 0)), 100))
+        has_bg_image = bool(params.get("has_bg_image"))
+        speed = max(0.25, min(float(params.get("speed", 1.0)), 4.0))
         smoothing = max(0, min(int(params.get("smoothing", 30)), 100)) / 100.0
         in_ext = params.get("in_ext", "mp4")
 
@@ -1524,10 +1527,21 @@ class Knockout:
             # 4. Per-frame mask + composite. Temporal EMA on the alpha kills
             #    frame-to-frame matte flicker (refine=False: guided filter is
             #    too slow per-frame; EMA covers the jitter instead).
+            #    Background precedence: bg_image > bg_blur (blurred source) >
+            #    bg_color > transparent.
             out_dir = os.path.join(tmp, "out")
             os.makedirs(out_dir)
             prev_alpha = None
             color = self._parse_color(bg_color) if bg_color else None
+            bg_img = None
+            if has_bg_image:
+                bg_img = Image.open(io.BytesIO(
+                    self._storage_download(f"{job_id}/bg.png"))).convert("RGB")
+            bg_img_sized = None  # bg_image resized to frame size (cached once)
+            # Map 0-100 blur strength to a Gaussian radius that reads as
+            # "portrait mode" at 30+ on 1080p frames.
+            blur_radius = 2 + (bg_blur / 100.0) * 38 if bg_blur > 0 else 0
+            opaque = bool(bg_img or bg_blur > 0 or color is not None)
             for i, name in enumerate(frame_files):
                 frame = Image.open(os.path.join(frames_dir, name)).convert("RGB")
                 _, mask = self._get_mask(frame, refine=False)
@@ -1536,18 +1550,26 @@ class Knockout:
                     a = (1.0 - smoothing) * a + smoothing * prev_alpha
                 prev_alpha = a
                 mask = Image.fromarray(np.clip(a, 0, 255).astype(np.uint8), mode="L")
-                if color is not None:
+                if bg_img is not None:
+                    if bg_img_sized is None or bg_img_sized.size != frame.size:
+                        bg_img_sized = bg_img.resize(frame.size, Image.LANCZOS)
+                    out = self._composite_linear(frame, bg_img_sized, mask)
+                elif bg_blur > 0:
+                    out = self._composite_linear(
+                        frame, frame.filter(ImageFilter.GaussianBlur(blur_radius)), mask)
+                elif color is not None:
                     out = self._composite_linear(frame, color, mask)
-                    out.save(os.path.join(out_dir, name))
                 else:
-                    rgba = frame.convert("RGBA")
-                    rgba.putalpha(mask)
-                    rgba.save(os.path.join(out_dir, name))
+                    out = frame.convert("RGBA")
+                    out.putalpha(mask)
+                out.save(os.path.join(out_dir, name))
                 if i % 30 == 0:
                     self._job_update(job_id, progress=5 + int(85 * i / n_frames))
 
-            # 5. Remux
-            if color is not None or fmt == "mp4":
+            # 5. Remux. speed != 1 plays the frame sequence at fps*speed and
+            #    tempo-shifts the audio to match (atempo chained: each stage
+            #    only accepts 0.5-2.0).
+            if opaque or fmt == "mp4":
                 out_name, vcodec = "out.mp4", ["-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18"]
                 content_type = "video/mp4"
             elif fmt == "webm":
@@ -1556,10 +1578,22 @@ class Knockout:
             else:  # prores4444 — real 10-bit alpha, drops into Resolve/Premiere/AE
                 out_name, vcodec = "out.mov", ["-c:v", "prores_ks", "-profile:v", "4444", "-pix_fmt", "yuva444p10le"]
                 content_type = "video/quicktime"
-            cmd = ["ffmpeg", "-y", "-framerate", f"{fps:.3f}",
+            cmd = ["ffmpeg", "-y", "-framerate", f"{fps * speed:.3f}",
                    "-i", os.path.join(out_dir, "%05d.png")]
             if has_audio:
-                cmd += ["-i", audio, "-c:a", "copy", "-shortest"]
+                cmd += ["-i", audio]
+                if abs(speed - 1.0) < 1e-6:
+                    cmd += ["-c:a", "copy"]
+                else:
+                    stages = []
+                    s = speed
+                    while s > 2.0:
+                        stages.append("atempo=2.0"); s /= 2.0
+                    while s < 0.5:
+                        stages.append("atempo=0.5"); s /= 0.5
+                    stages.append(f"atempo={s:.4f}")
+                    cmd += ["-filter:a", ",".join(stages), "-c:a", "aac"]
+                cmd += ["-shortest"]
             cmd += vcodec + [os.path.join(tmp, out_name)]
             subprocess.run(cmd, capture_output=True, timeout=600, check=True)
 
@@ -1569,10 +1603,11 @@ class Knockout:
             self._job_update(job_id, status="done", progress=100,
                              result_path=f"{job_id}/{out_name}")
 
-            # 7. Bill on the dedicated video meter: 1 unit = 1 output second,
+            # 7. Bill on the dedicated video meter: 1 unit = 1 OUTPUT second,
             #    priced at $0.10/second (separate line from the image meter).
+            #    speed shortens the output, so it also shrinks the bill.
             seconds = float(job.get("seconds") or (n_frames / fps))
-            units = max(1, math.ceil(seconds))
+            units = max(1, math.ceil(seconds / speed))
             status_u, body_u = self._supabase_request(
                 "GET", "/rest/v1/users",
                 params={"id": f"eq.{job['user_id']}", "select": "tier,stripe_customer_id"})
@@ -1702,7 +1737,7 @@ class Knockout:
             "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
             "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent' + 'enhance'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
             "/collage": ("multipart 'files' (2-9) + 'main_index' + 'main_position' (TL..BR|C) — paid tiers, billed N units", "client.collage({ files, mainPosition: 'BR' })"),
-            "/video/remove": ("multipart 'file' (mp4/mov/avi/webm/mkv, 15s max) + 'format' (prores4444|webm|mp4) + 'bg_color' + 'smoothing' — async, $0.05/s, paid tiers", "POST /video/remove -> {job_id}, then GET /jobs/{job_id}"),
+            "/video/remove": ("multipart 'file' (mp4/mov/avi/webm/mkv, 15s max) + 'format' (prores4444|webm|mp4) + 'bg_color'|'bg_image'|'bg_blur' + 'speed' (0.25-4) + 'smoothing' — async, $0.10/output-sec, paid tiers", "POST /video/remove -> {job_id}, then GET /jobs/{job_id}"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
@@ -2611,6 +2646,9 @@ class Knockout:
             file: UploadFile = File(...),
             format: str = Form("prores4444"),
             bg_color: Optional[str] = Form(None),
+            bg_image: Optional[UploadFile] = File(None),
+            bg_blur: int = Form(0),
+            speed: float = Form(1.0),
             smoothing: int = Form(30),
             authorization: Optional[str] = Header(default=None),
         ):
@@ -2619,21 +2657,37 @@ class Knockout:
             poll GET /jobs/{job_id} for progress and the result URL.
 
             - `format`: prores4444 (MOV, real 10-bit alpha) | webm (VP9 alpha)
-              | mp4 (H.264 — requires bg_color, no alpha).
-            - `bg_color`: composite onto a solid color instead of transparency.
+              | mp4 (H.264 — needs an opaque background, no alpha).
+            - Backgrounds (precedence: image > blur > color > transparent):
+              `bg_image` composite onto an uploaded image; `bg_blur` 1-100
+              composite onto a blurred copy of the source (portrait look);
+              `bg_color` solid hex.
+            - `speed`: 0.25-4.0 output speed multiplier. Audio is tempo-shifted
+              to match. Billing is on OUTPUT seconds, so 2x speed halves cost.
             - `smoothing`: 0-100 temporal alpha smoothing (kills matte flicker).
 
             Caps: 15s max, 30fps, 200MB upload, 1080p processing. Paid tiers
-            only. Billed at $0.05 per output second.
+            only. Billed at $0.10 per output second ($0.08 on Knockout Plus).
             """
             ctx, _t = self._begin(authorization, "/video/remove")
             fmt = format.strip().lower()
             if fmt not in VIDEO_FORMATS:
                 raise HTTPException(400, "format must be prores4444, webm, or mp4")
-            if fmt == "mp4" and not bg_color:
-                raise HTTPException(400, "mp4 cannot carry alpha — set bg_color or use prores4444/webm")
+            bg_blur = max(0, min(int(bg_blur), 100))
+            if not (0.25 <= float(speed) <= 4.0):
+                raise HTTPException(400, "speed must be between 0.25 and 4.0")
+            has_bg = bool(bg_color or bg_image or bg_blur > 0)
+            if fmt == "mp4" and not has_bg:
+                raise HTTPException(400, "mp4 cannot carry alpha — set bg_color/bg_image/bg_blur or use prores4444/webm")
             if bg_color:
                 self._parse_color(bg_color)  # validate early
+            bg_png = None
+            if bg_image is not None:
+                # Validate + normalize the backdrop to PNG once, at submit.
+                bg_obj = self._open_image(bg_image.file.read())
+                buf = io.BytesIO()
+                bg_obj.convert("RGB").save(buf, format="PNG")
+                bg_png = buf.getvalue()
             ext = (file.filename or "").rsplit(".", 1)[-1].lower()
             if ext not in VIDEO_INPUT_EXTS:
                 raise HTTPException(400, f"unsupported container .{ext} — use {', '.join(sorted(VIDEO_INPUT_EXTS))}")
@@ -2658,9 +2712,19 @@ class Knockout:
                 os.unlink(probe_path)
             if seconds > VIDEO_MAX_SECONDS:
                 raise HTTPException(400, f"clip is {seconds:.1f}s — {VIDEO_MAX_SECONDS}s max for now")
+            # Slow motion LENGTHENS the output — cap the OUTPUT length too, or a
+            # 15s clip at 0.25x becomes a 60s render (4x the bill and a ProRes
+            # big enough to blow the storage limit).
+            if seconds / float(speed) > VIDEO_MAX_SECONDS:
+                raise HTTPException(
+                    400,
+                    f"output would be {seconds / float(speed):.1f}s at speed={speed} — "
+                    f"max {VIDEO_MAX_SECONDS}s output; use a shorter clip or higher speed")
 
             job_id = str(uuid.uuid4())
             self._storage_upload(f"{job_id}/in.{ext}", data, file.content_type or "video/mp4")
+            if bg_png is not None:
+                self._storage_upload(f"{job_id}/bg.png", bg_png, "image/png")
             status, _ = self._supabase_request(
                 "POST", "/rest/v1/video_jobs",
                 body={
@@ -2670,6 +2734,8 @@ class Knockout:
                     "status": "queued",
                     "seconds": round(seconds, 2),
                     "params": {"format": fmt, "bg_color": bg_color,
+                               "bg_blur": bg_blur, "speed": float(speed),
+                               "has_bg_image": bg_png is not None,
                                "smoothing": smoothing, "in_ext": ext},
                 },
                 prefer="return=minimal")
@@ -2677,13 +2743,15 @@ class Knockout:
                 raise HTTPException(503, "could not create job")
             Knockout().process_video_job.spawn(job_id)
 
-            est_seconds = max(1, math.ceil(seconds))
+            # Billing is on OUTPUT seconds — speed shortens the output and the bill.
+            est_seconds = max(1, math.ceil(seconds / float(speed)))
             # Usage row for the submit; billing happens in the worker on success.
             self._end(ctx, "/video/remove", _t, skip_meter=True)
             return {
                 "job_id": job_id,
                 "status": "queued",
                 "seconds": round(seconds, 2),
+                "output_seconds": round(seconds / float(speed), 2),
                 "estimated_cost_usd": round(est_seconds * 0.10, 2),
                 "poll": f"/jobs/{job_id}",
             }
