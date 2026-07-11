@@ -287,7 +287,7 @@ Video background removal — frame-by-frame BiRefNet with temporal alpha smoothi
 
 | Field | Type | Default | Description |
 |---|---|---|---|
-| `file` | binary | required | `mp4`, `mov`, `avi`, `webm`, or `mkv`. Max 30 seconds, 200MB. Frames above 1080p are downscaled for processing. |
+| `file` | binary | required | `mp4`, `mov`, `avi`, `webm`, or `mkv`. Max 15 seconds, 200MB. Frames above 1080p are downscaled for processing. |
 | `format` | string | `prores4444` | `prores4444` — MOV with a real 10-bit alpha channel (drops into DaVinci Resolve, Premiere Pro, After Effects, Final Cut; no green screen). `webm` — VP9 with alpha, for web. `mp4` — H.264, requires `bg_color` (no alpha). |
 | `bg_color` | string | — | Composite every frame onto a solid color instead of transparency. |
 | `smoothing` | int | `30` | `0`–`100` temporal alpha smoothing across frames. Kills matte flicker; lower it for fast-moving subjects. |

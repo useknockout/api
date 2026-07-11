@@ -79,11 +79,14 @@ DEMO_MAX_DIM = 512                 # demo output capped to this longest side
 DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP overrides
 
 # ---- /video/remove (async jobs) ----
-VIDEO_MAX_SECONDS = 30             # hard cap per clip (paid tiers; raise per-account later)
+VIDEO_MAX_SECONDS = 15             # hard cap per clip: 15s ProRes ~305MB stays under the 500MB storage limit; 30s would exceed it
 VIDEO_FPS_CAP = 30                 # frames processed per second of video, max
 VIDEO_MAX_BYTES = 200 * 1024 * 1024
 VIDEO_MAX_DIM = 1920               # frames downscaled to this longest side before inference
-VIDEO_UNITS_PER_SECOND = 2.5       # billed via images.processed meter: $0.05/s at the $0.02 unit
+VIDEO_METER_EVENT = os.environ.get("STRIPE_VIDEO_METER_EVENT", "video.seconds").strip() or "video.seconds"
+# Video bills on its OWN Stripe meter (not the image meter): 1 unit = 1 output
+# second, priced at $0.10/second. 15s clip = 15 units = $1.50. Set the price to
+# $0.10 ($10/unit? no — unit_amount 10 cents) on the video.seconds meter.
 VIDEO_BUCKET = "video-jobs"
 VIDEO_FORMATS = frozenset({"prores4444", "webm", "mp4"})
 VIDEO_INPUT_EXTS = frozenset({"mp4", "mov", "avi", "webm", "mkv"})
@@ -1566,10 +1569,10 @@ class Knockout:
             self._job_update(job_id, status="done", progress=100,
                              result_path=f"{job_id}/{out_name}")
 
-            # 7. Bill: $0.05/output-second via the base image meter
-            #    (units = ceil(seconds * 2.5) at the $0.02 unit price).
+            # 7. Bill on the dedicated video meter: 1 unit = 1 output second,
+            #    priced at $0.10/second (separate line from the image meter).
             seconds = float(job.get("seconds") or (n_frames / fps))
-            units = max(1, math.ceil(seconds * VIDEO_UNITS_PER_SECOND))
+            units = max(1, math.ceil(seconds))
             status_u, body_u = self._supabase_request(
                 "GET", "/rest/v1/users",
                 params={"id": f"eq.{job['user_id']}", "select": "tier,stripe_customer_id"})
@@ -1578,7 +1581,8 @@ class Knockout:
                    "tier": urow.get("tier", "payg"),
                    "stripe_customer_id": urow.get("stripe_customer_id"),
                    "is_legacy": False}
-            self._log_usage(ctx, "/video/remove", 200, 0, units=units)
+            self._log_usage(ctx, "/video/remove", 200, 0, units=units,
+                            meter_event=VIDEO_METER_EVENT)
         except Exception as e:
             self._job_update(job_id, status="error", error=str(e)[:500])
         finally:
@@ -1698,7 +1702,7 @@ class Knockout:
             "/inpaint": ("multipart 'file' + optional 'mask' OR 'x,y,w,h' bbox; 'dilation' 0..32", "client.inpaint({ file, mask, dilation: 8 })"),
             "/studio-shot": ("multipart 'file' + 'bg_color' + 'aspect' + 'padding' + 'shadow' + 'transparent' + 'enhance'", "client.studioShot({ file, aspect: '1:1', transparent: true })"),
             "/collage": ("multipart 'files' (2-9) + 'main_index' + 'main_position' (TL..BR|C) — paid tiers, billed N units", "client.collage({ files, mainPosition: 'BR' })"),
-            "/video/remove": ("multipart 'file' (mp4/mov/avi/webm/mkv, 30s max) + 'format' (prores4444|webm|mp4) + 'bg_color' + 'smoothing' — async, $0.05/s, paid tiers", "POST /video/remove -> {job_id}, then GET /jobs/{job_id}"),
+            "/video/remove": ("multipart 'file' (mp4/mov/avi/webm/mkv, 15s max) + 'format' (prores4444|webm|mp4) + 'bg_color' + 'smoothing' — async, $0.05/s, paid tiers", "POST /video/remove -> {job_id}, then GET /jobs/{job_id}"),
             "/compare": ("multipart 'file' — returns side-by-side preview", "client.compare({ file })"),
             "/headshot": ("multipart 'file' + 'bg_color' or 'bg_blur' + 'aspect'", "client.headshot({ file, bgBlur: true })"),
             "/preview": ("multipart 'file' + 'max_dim' (64..1024)", "client.preview({ file, maxDim: 512 })"),
@@ -2619,7 +2623,7 @@ class Knockout:
             - `bg_color`: composite onto a solid color instead of transparency.
             - `smoothing`: 0-100 temporal alpha smoothing (kills matte flicker).
 
-            Caps: 30s max, 30fps, 200MB upload, 1080p processing. Paid tiers
+            Caps: 15s max, 30fps, 200MB upload, 1080p processing. Paid tiers
             only. Billed at $0.05 per output second.
             """
             ctx, _t = self._begin(authorization, "/video/remove")
@@ -2673,14 +2677,14 @@ class Knockout:
                 raise HTTPException(503, "could not create job")
             Knockout().process_video_job.spawn(job_id)
 
-            est_units = max(1, math.ceil(seconds * VIDEO_UNITS_PER_SECOND))
+            est_seconds = max(1, math.ceil(seconds))
             # Usage row for the submit; billing happens in the worker on success.
             self._end(ctx, "/video/remove", _t, skip_meter=True)
             return {
                 "job_id": job_id,
                 "status": "queued",
                 "seconds": round(seconds, 2),
-                "estimated_cost_units": est_units,
+                "estimated_cost_usd": round(est_seconds * 0.10, 2),
                 "poll": f"/jobs/{job_id}",
             }
 

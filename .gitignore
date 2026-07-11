@@ -83,3 +83,6 @@ SDK_PARITY.md
 # tool junk + regeneratable eval outputs
 .playwright-mcp/
 eval/cases/*/out/
+
+# session handoff protocol file — never commit
+HANDOFF.md
