@@ -761,6 +761,9 @@ class Knockout:
                     "endpoint": endpoint,
                     "status": status,
                     "latency_ms": latency_ms,
+                    # Billing weight: images/psd = 1 per call, collage = N photos,
+                    # video = output seconds. Lets the dashboard compute exact spend.
+                    "units": max(1, int(units)),
                 },
                 prefer="return=minimal",
             )
