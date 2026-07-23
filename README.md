@@ -84,22 +84,11 @@ Input → Output:
 
 ## Quick start
 
-### Try it right now — no signup
-
-The shared demo key works instantly, no account needed:
-
-```bash
-curl -X POST "https://useknockout--api.modal.run/remove" \
-  -H "Authorization: Bearer kno_public_beta_4d7e9f1a3c5b2e8d6a9f7c1b3e5d8a2f" \
-  -F "file=@your-image.jpg" \
-  -o out.png
-```
-
-The demo key is deliberately limited: **`/remove`, `/replace-bg`, `/mask`, `/sticker`, `/compare` only, 512px output, shared daily cap.** Enough to judge the quality — sign up below for full resolution and every other endpoint.
-
-### Get your own key — 10 images/month free, no card
+### Get your key — 10 images/month free, no card
 
 → **[useknockout.com/signin](https://useknockout.com/signin)**
+
+Sign in, click to reveal your key on the dashboard, and paste it below. No credit card, ready in seconds.
 
 - **10 full-resolution images/month free, forever** — no card needed
 - Pay-as-you-go at **$0.02/image** unlocks all endpoints — AI upscale, face restore, colorize, e-commerce presets, batch, video, and more (10× cheaper than remove.bg's $0.20)
@@ -341,7 +330,7 @@ For reference — the same image on remove.bg is **$0.20** at their PAYG rate.
 
 **Knockout Plus** additionally unlocks layered PSD at a flat rate, edge despill, saved presets (`/presets`), custom watermarks, resizing, and compression control across all endpoints.
 
-The anonymous demo key (no signup) covers `/remove`, `/replace-bg`, `/mask`, `/sticker`, and `/compare` at 512px with a shared daily cap. `/estimate` (pricing calculator) is free for everyone.
+Try the API in your browser with no key at the [playground](https://useknockout.com/playground). `/estimate` (pricing calculator) is free for everyone.
 
 ---
 
