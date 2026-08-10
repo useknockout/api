@@ -875,7 +875,7 @@ class Knockout:
             Image.LANCZOS,
         )
 
-    def _get_mask(self, image_obj, refine: bool = True):
+    def _get_mask(self, image_obj, refine: bool = True, count: bool = True):
         """Run BiRefNet on an RGB image, return (rgb_image, mask_pil).
 
         Pads the image to a square BEFORE the model's fixed 1024x1024 resize so
@@ -887,6 +887,9 @@ class Knockout:
         refine=False skips the guided-filter edge refinement — for callers that
         only need a region (e.g. /inpaint), where the full-res float32 filter
         buffers are pure wasted memory + latency.
+
+        count=False skips the public stats counter — for internal second passes
+        (detect=high_recall) that are still one user-facing image.
         """
         rgb = image_obj.convert("RGB")
         w, h = rgb.size
@@ -906,7 +909,8 @@ class Knockout:
             mask = mask.crop((0, 0, w, h))  # drop the padded region
         if refine:
             mask = self._refine_alpha(rgb, mask)
-        self._bump_counter()
+        if count:
+            self._bump_counter()
         return rgb, mask
 
     def _refine_alpha(self, rgb, mask, radius: int = 8, eps: float = 1e-3):
@@ -1074,8 +1078,211 @@ class Knockout:
             return None
         return max(0.0, min(float(despill) / 100.0, 1.0))
 
-    def _remove(self, image_obj, despill=None):
-        rgb, mask = self._get_mask(image_obj)
+    @staticmethod
+    def _harden_alpha(mask, k: float = 4.0, erode_px: int = 1):
+        """Commit ambiguous alpha to opaque-or-transparent (product-shot edges).
+
+        BiRefNet + guided-filter refinement leave a soft mid-alpha band around
+        subjects (measured ~4-8% of pixels). On hard-surface subjects that
+        renders as a grey halo. Steepening the alpha curve around 0.5 removes
+        ~86% of the halo while thin SOLID structures (club shafts, jewelry
+        chains) survive, because they sit at alpha~1, not mid-alpha
+        (eval/cases: chain mass -0.46%, hair is the exception — keep soft for
+        portraits). A 1px erosion then trims the residual fringe the way
+        remove.bg/Canva do: trade one pixel of true edge for a clean cut.
+        """
+        from PIL import ImageFilter
+        a = np.asarray(mask, dtype=np.float32) / 255.0
+        a = np.clip((a - 0.5) * k + 0.5, 0.0, 1.0)
+        out = Image.fromarray((a * 255).astype(np.uint8), mode="L")
+        if erode_px > 0:
+            out = out.filter(ImageFilter.MinFilter(2 * erode_px + 1))
+        return out
+
+    def _check_edge(self, edge: str) -> str:
+        e = (edge or "soft").strip().lower()
+        if e not in ("soft", "hard"):
+            raise HTTPException(400, "edge must be 'soft' or 'hard'")
+        return e
+
+    def _check_detect(self, detect: str) -> str:
+        d = (detect or "standard").strip().lower()
+        if d not in ("standard", "high_recall"):
+            raise HTTPException(400, "detect must be 'standard' or 'high_recall'")
+        return d
+
+    def _require_paid_compute(self, ctx: dict, feature: str = "This mode") -> None:
+        """Gate 2x-inference modes to paying tiers. 402 for demo/free.
+
+        detect=high_recall runs two model passes for one billed image — without
+        this gate the shared demo key or a free account could buy double GPU
+        at single-request cost (the exact amplification the demo cap exists to
+        prevent). Internal full-access (is_legacy) bypasses for testing.
+        """
+        if ctx.get("is_legacy"):
+            return
+        if not ctx.get("is_demo") and ctx.get("tier") not in (None, "free"):
+            return  # any paid tier (payg/pro/volume)
+        raise HTTPException(
+            status_code=402,
+            detail=(
+                f"{feature} runs double inference and needs a paid plan. "
+                "Pay-as-you-go at useknockout.com/pricing, no minimum."
+            ),
+        )
+
+    @staticmethod
+    def _boost_for_detect(rgb):
+        """Chroma/contrast-boosted copy of the image for a second detection pass.
+
+        Low-contrast product shots (e.g. a beige sheet on white paper, measured
+        ~4% RGB separation on a real client catalog) sit at the edge of what the
+        model can see: the mask bites chunks out of the product exactly where it
+        meets a near-identical background. Boosting chroma pushes those near-white
+        tones apart so pass 2 recovers what pass 1 missed. The boost is NOT safe
+        alone — it recovers one boundary while destroying another — which is why
+        it only ever feeds the union in detect=high_recall, never replaces pass 1.
+        """
+        b = ImageOps.autocontrast(rgb, cutoff=1)
+        b = ImageEnhance.Color(b).enhance(2.2)
+        return ImageEnhance.Contrast(b).enhance(1.35)
+
+    @staticmethod
+    def _srgb_to_lab_weighted(rgb_arr):
+        """sRGB (float 0-255, HxWx3) -> Lab with L scaled by 0.4.
+
+        Chroma (a/b) carries the product-vs-background decision; de-emphasizing
+        lightness separates e.g. white base paper from a pale pink sheet, which
+        differ almost entirely in chroma. Validated: full-weight L left a pale
+        sheet's 53k-px white sliver untouched; 0.4 removed all but 7px.
+        """
+        c = rgb_arr / 255.0
+        c = np.where(c > 0.04045, ((c + 0.055) / 1.055) ** 2.4, c / 12.92)
+        M = np.array([[0.4124, 0.3576, 0.1805],
+                      [0.2126, 0.7152, 0.0722],
+                      [0.0193, 0.1192, 0.9505]], dtype=np.float32)
+        xyz = c @ M.T
+        xyz /= np.array([0.9505, 1.0, 1.089], dtype=np.float32)
+        f = np.where(xyz > 0.008856, np.cbrt(xyz), 7.787 * xyz + 16 / 116)
+        L = (116 * f[..., 1] - 16) * 0.4
+        a = 500 * (f[..., 0] - f[..., 1])
+        b = 200 * (f[..., 1] - f[..., 2])
+        return np.stack([L, a, b], axis=-1).astype(np.float32)
+
+    @staticmethod
+    def _kmeans_np(pts, k=3, iters=25, seed=0):
+        """Tiny numpy k-means (<=20k pts x 3 dims) — no sklearn dependency."""
+        rng = np.random.default_rng(seed)
+        C = pts[rng.choice(len(pts), size=min(k, len(pts)), replace=False)].copy()
+        for _ in range(iters):
+            d = ((pts[:, None, :] - C[None]) ** 2).sum(-1)
+            lbl = d.argmin(1)
+            for j in range(len(C)):
+                m = lbl == j
+                if m.any():
+                    C[j] = pts[m].mean(0)
+        return C
+
+    def _decontaminate_mask(self, rgb, mask, band_r=15, bg_margin=1.5, fg_margin=2.0,
+                            samples=20000, work=1024):
+        """Trimap-band color decontamination (the step generic salience lacks).
+
+        The model finds objects, not colors — so a white strip of base paper
+        beside a pink sheet, or a black rig fragment beside a white sheet, gets
+        included even though its color screams background. This walks only the
+        uncertain band around the mask boundary, builds per-image k-means color
+        models of confident-foreground and confident-background (Lab, chroma-
+        weighted), and reassigns band pixels ONLY on strong evidence margins.
+        Asymmetric: removing needs 1.5x, adding needs 2.0x (adding is riskier),
+        and alpha is only ever raised where the model already gave >32 support.
+        Black products are safe by construction: a black core makes black a
+        FOREGROUND color (validated: synthetic black-on-white, interior 100.0%
+        intact). Analysis at 1024 work-scale; band_r=15 there covers ~45px at
+        3072 input — wider than the widest measured contamination strip.
+        Fails open: any error returns the input mask unchanged.
+        """
+        try:
+            from PIL import ImageFilter
+            alpha_u8 = np.asarray(mask.convert("L"))
+            H, W = alpha_u8.shape
+            s = min(1.0, work / float(max(H, W)))  # never upscale small inputs for analysis
+            wh, ww = max(1, int(round(H * s))), max(1, int(round(W * s)))
+            rgb_w = np.asarray(rgb.resize((ww, wh), Image.BILINEAR), dtype=np.float32)
+            a_w = np.asarray(mask.convert("L").resize((ww, wh), Image.BILINEAR)).astype(np.float32)
+
+            size = 2 * band_r + 1
+            op_img = Image.fromarray(((a_w > 128) * 255).astype(np.uint8))
+            core_fg = np.asarray(op_img.filter(ImageFilter.MinFilter(size))) > 128
+            far_bg = ~(np.asarray(op_img.filter(ImageFilter.MaxFilter(size))) > 128)
+            band = ~core_fg & ~far_bg
+            if not band.any() or not core_fg.any() or not far_bg.any():
+                return mask
+
+            lab = self._srgb_to_lab_weighted(rgb_w)
+            rng = np.random.default_rng(0)
+
+            def sample(m):
+                ys, xs = np.where(m)
+                idx = rng.choice(len(ys), size=min(samples, len(ys)), replace=False)
+                return lab[ys[idx], xs[idx]]
+
+            Cf = self._kmeans_np(sample(core_fg))
+            Cb = self._kmeans_np(sample(far_bg))
+
+            bys, bxs = np.where(band)
+            p = lab[bys, bxs]
+            dfg = np.sqrt(((p[:, None, :] - Cf[None]) ** 2).sum(-1)).min(1)
+            dbg = np.sqrt(((p[:, None, :] - Cb[None]) ** 2).sum(-1)).min(1)
+            to_bg = dbg * bg_margin < dfg
+            to_fg = (dfg * fg_margin < dbg) & (a_w[bys, bxs] > 32)
+
+            out_w = a_w.copy()
+            out_w[bys[to_bg], bxs[to_bg]] = 0.0
+            out_w[bys[to_fg], bxs[to_fg]] = 255.0
+            out_img = Image.fromarray(out_w.astype(np.uint8)).filter(ImageFilter.GaussianBlur(1.0))
+
+            # apply changes only inside the (upsampled) band — outside it the
+            # original full-resolution alpha passes through untouched
+            up_clean = np.asarray(out_img.resize((W, H), Image.BILINEAR), dtype=np.float32)
+            band_full = np.asarray(
+                Image.fromarray((band * 255).astype(np.uint8)).resize((W, H), Image.BILINEAR)
+            ) > 64
+            out = alpha_u8.astype(np.float32).copy()
+            out[band_full] = up_clean[band_full]
+            return Image.fromarray(np.clip(out, 0, 255).astype(np.uint8), mode="L")
+        except Exception:
+            return mask  # cleanup is best-effort; never break the request
+
+    def _acquire_mask(self, image_obj, detect: str = "standard", decontaminate: bool = False):
+        """Shared mask acquisition for /remove, /studio-shot, /smart-crop.
+
+        detect=high_recall: second inference on a chroma-boosted copy,
+        per-pixel max of the RAW alphas, then ONE guided-filter refine against
+        the original image. The passes fail in DIFFERENT places on low-contrast
+        boundaries, so the union keeps whatever either was confident about
+        (validated on client flat-lay shots: both eaten corners recovered).
+        Fusing raw-then-refining ties the final boundary to the pixels actually
+        returned — refining each pass separately would snap pass 2's alpha to
+        the boosted copy's shifted edges. Union is inclusion-biased (can only
+        add alpha) — hence opt-in and named high_recall, not "better": it
+        trades precision for recall by construction.
+        """
+        if detect == "high_recall":
+            from PIL import ImageChops
+            rgb, raw1 = self._get_mask(image_obj, refine=False)
+            _, raw2 = self._get_mask(self._boost_for_detect(rgb), refine=False, count=False)
+            mask = self._refine_alpha(rgb, ImageChops.lighter(raw1, raw2))
+        else:
+            rgb, mask = self._get_mask(image_obj)
+        if decontaminate:
+            mask = self._decontaminate_mask(rgb, mask)
+        return rgb, mask
+
+    def _remove(self, image_obj, despill=None, edge: str = "soft", detect: str = "standard",
+                decontaminate: bool = False):
+        rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+        if edge == "hard":
+            mask = self._harden_alpha(mask)
         clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
         result = clean_rgb.convert("RGBA")
         result.putalpha(mask)
@@ -1484,7 +1691,10 @@ class Knockout:
         bg_blur = max(0, min(int(params.get("bg_blur", 0)), 100))
         has_bg_image = bool(params.get("has_bg_image"))
         speed = max(0.25, min(float(params.get("speed", 1.0)), 4.0))
-        smoothing = max(0, min(int(params.get("smoothing", 30)), 100)) / 100.0
+        # Cap at 95: smoothing=100 made every frame reuse the FIRST frame's
+        # mask forever (a = 0*current + 1.0*prev) — a frozen matte, not
+        # "maximum smoothing". 95 is the highest value that still converges.
+        smoothing = max(0, min(int(params.get("smoothing", 30)), 95)) / 100.0
         in_ext = params.get("in_ext", "mp4")
 
         tmp = tempfile.mkdtemp(prefix=f"vj-{job_id[:8]}-")
@@ -1644,6 +1854,17 @@ class Knockout:
         class UrlBody(BaseModel):
             url: HttpUrl
             format: str = "png"
+            edge: str = "soft"
+            detect: str = "standard"
+            decontaminate: bool = False
+            quality: Optional[int] = None
+            max_dim: Optional[int] = None
+            width: Optional[int] = None
+            height: Optional[int] = None
+            despill: Optional[float] = None
+            watermark: Optional[str] = None
+            watermark_opacity: float = 0.5
+            preset: Optional[str] = None
 
         class BatchUrlBody(BaseModel):
             urls: List[HttpUrl]
@@ -1662,7 +1883,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.8.0",
+                "version": "0.12.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
@@ -1864,6 +2085,9 @@ class Knockout:
             width: Optional[int] = Form(None),
             height: Optional[int] = Form(None),
             despill: Optional[float] = Form(None),
+            edge: str = Form("soft"),
+            detect: str = Form("standard"),
+            decontaminate: bool = Form(False),
             watermark: Optional[str] = Form(None),
             watermark_opacity: float = Form(0.5),
             preset: Optional[str] = Form(None),
@@ -1882,9 +2106,14 @@ class Knockout:
                     p["despill"], p["watermark"],
                 )
             fmt = self._check_format(format)
+            edge = self._check_edge(edge)
+            detect = self._check_detect(detect)
+            if detect == "high_recall":
+                self._require_paid_compute(ctx, "detect=high_recall")
             data = file.file.read()
             image_obj = self._open_image(data)
-            result = self._remove(image_obj, despill=despill)
+            result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
+                                  decontaminate=decontaminate)
             if ctx.get("is_demo"):
                 result = self._downscale_max(result, DEMO_MAX_DIM)
                 # Resize params could upscale right past the demo cap — drop them.
@@ -1902,7 +2131,27 @@ class Knockout:
             authorization: Optional[str] = Header(default=None),
         ):
             ctx, _t = self._begin(authorization, "/remove-url")
+            # Param parity with multipart /remove (same gates, same pipeline).
+            quality, max_dim, width, height = body.quality, body.max_dim, body.width, body.height
+            despill, watermark = body.despill, body.watermark
+            if despill is not None or watermark or body.preset:
+                self._require_pro(ctx, "Premium output (despill, watermark, presets)")
+            if body.preset:
+                p = self._apply_preset(ctx, body.preset, {
+                    "quality": quality, "max_dim": max_dim, "width": width,
+                    "height": height, "despill": despill, "watermark": watermark,
+                })
+                quality, max_dim, width, height, despill, watermark = (
+                    p["quality"], p["max_dim"], p["width"], p["height"],
+                    p["despill"], p["watermark"],
+                )
             fmt = self._check_format(body.format)
+            # Validate options BEFORE the outbound fetch — an invalid edge or
+            # detect must 400 without us making a network request or image work.
+            edge = self._check_edge(body.edge)
+            detect = self._check_detect(body.detect)
+            if detect == "high_recall":
+                self._require_paid_compute(ctx, "detect=high_recall")
 
             try:
                 resp = requests.get(str(body.url), timeout=15)
@@ -1911,8 +2160,12 @@ class Knockout:
                 raise HTTPException(400, f"Could not fetch image: {e}")
 
             image_obj = self._open_image(resp.content)
-            result = self._remove(image_obj)
-            out_resp = self._response(result, fmt)
+            result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
+                                  decontaminate=body.decontaminate)
+            out_resp = self._finalize_response(
+                result, fmt, quality=quality, max_dim=max_dim, width=width,
+                height=height, watermark=watermark, watermark_opacity=body.watermark_opacity,
+            )
             self._end(ctx, "/remove-url", _t)
             return out_resp
 
@@ -2103,6 +2356,8 @@ class Knockout:
             padding: int = Form(24),
             transparent: bool = Form(True),
             format: str = Form("png"),
+            detect: str = Form("standard"),
+            decontaminate: bool = Form(False),
             authorization: Optional[str] = Header(default=None),
         ):
             """
@@ -2110,13 +2365,18 @@ class Knockout:
 
             `transparent=true` (default): return cropped cutout with transparent background.
             `transparent=false`: return cropped region from the original image (bg preserved).
+            `detect` / `decontaminate`: same as /remove — decontaminate also
+            tightens the crop box, since background strips no longer inflate it.
             """
             ctx, _t = self._begin(authorization, "/smart-crop")
+            detect = self._check_detect(detect)
+            if detect == "high_recall":
+                self._require_paid_compute(ctx, "detect=high_recall")
             allowed = frozenset({"png", "webp", "jpg"}) if not transparent else frozenset({"png", "webp"})
             fmt = self._check_format(format, allowed=allowed)
             data = file.file.read()
             image_obj = self._open_image(data)
-            rgb, mask = self._get_mask(image_obj)
+            rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
 
             bbox = self._bounding_box(mask)
             if bbox is None:
@@ -2408,6 +2668,8 @@ class Knockout:
             watermark: Optional[str] = Form(None),
             watermark_opacity: float = Form(0.5),
             preset: Optional[str] = Form(None),
+            detect: str = Form("standard"),
+            decontaminate: bool = Form(False),
             authorization: Optional[str] = Header(default=None),
         ):
             """
@@ -2424,6 +2686,9 @@ class Knockout:
             ctx, _t = self._begin(authorization, "/studio-shot")
             status_code = 200
             try:
+                detect = self._check_detect(detect)
+                if detect == "high_recall":
+                    self._require_paid_compute(ctx, "detect=high_recall")
                 if despill is not None or watermark or preset:
                     self._require_pro(ctx, "Premium output (despill, watermark, presets)")
                 if preset:
@@ -2440,7 +2705,7 @@ class Knockout:
                     fmt = "png"  # jpg can't carry alpha — coerce to a lossless alpha format
                 data = file.file.read()
                 image_obj = self._open_image(data)
-                rgb, mask = self._get_mask(image_obj)
+                rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
 
                 try:
                     aw_str, ah_str = aspect.split(":")
@@ -2502,8 +2767,10 @@ class Knockout:
                 if transparent:
                     # Transparent preset — centered cutout on a fully transparent
                     # canvas. No bg fill, no shadow (a shadow needs an opaque bg).
+                    # Unmasked paste: using subject_cut as its own paste mask
+                    # multiplies alpha into itself (128 -> 64) — Codex 009 P1.
                     composed = Image.new("RGBA", (target_w, target_h), (0, 0, 0, 0))
-                    composed.paste(subject_cut, (paste_x, paste_y), subject_cut)
+                    composed.paste(subject_cut, (paste_x, paste_y))
                 elif shadow:
                     full_mask_for_shadow = Image.new("L", (target_w, target_h), 0)
                     full_mask_for_shadow.paste(subject_mask, (paste_x, paste_y))
@@ -2667,7 +2934,8 @@ class Knockout:
               `bg_color` solid hex.
             - `speed`: 0.25-4.0 output speed multiplier. Audio is tempo-shifted
               to match. Billing is on OUTPUT seconds, so 2x speed halves cost.
-            - `smoothing`: 0-100 temporal alpha smoothing (kills matte flicker).
+            - `smoothing`: 0-100 temporal alpha smoothing (kills matte flicker;
+              values above 95 are clamped — lower it for fast-moving subjects).
 
             Caps: 15s max, 30fps, 200MB upload, 1080p processing. Paid tiers
             only. Billed at $0.10 per output second ($0.08 on Knockout Plus).
@@ -3124,7 +3392,7 @@ class Knockout:
         def headshot_endpoint(
             file: UploadFile = File(...),
             bg_color: str = Form("#FFFFFF"),
-            bg_blur: bool = Form(False),
+            bg_blur: str = Form("false"),
             blur_radius: int = Form(20),
             aspect: str = Form("4:5"),
             padding: int = Form(64),
@@ -3137,10 +3405,32 @@ class Knockout:
 
             Removes background, crops to subject + padding, centers on a portrait
             canvas (default 4:5), and either fills with a solid color or a blurred
-            copy of the original (set `bg_blur=true`). `head_top_ratio` controls
-            how much empty space sits above the subject (default 18% of canvas).
+            copy of the original. `bg_blur` accepts true/false OR an intensity
+            2-100 (same scale as /video/remove; numeric overrides blur_radius).
+            `1` stays a legacy alias for true (uses blur_radius, default 20),
+            so the intensity scale starts at 2 — use 2 for the faintest blur.
+            `head_top_ratio` controls how much empty space sits above the
+            subject (default 18% of canvas).
             """
             ctx, _t = self._begin(authorization, "/headshot")
+            # bg_blur: bool-like ("true"/"false") for back-compat, or 0-100
+            # intensity matching the /video/remove scale.
+            # Truthy/falsy sets must cover everything pydantic's bool coercion
+            # accepted before this param became a string, or old callers 400.
+            _blur_raw = (bg_blur or "false").strip().lower()
+            if _blur_raw in ("true", "t", "yes", "y", "on", "1"):
+                blur_on, blur_r = True, max(1, min(int(blur_radius), 80))
+            elif _blur_raw in ("false", "f", "no", "n", "off", "", "0", "none"):
+                blur_on, blur_r = False, 0
+            else:
+                try:
+                    _n = int(_blur_raw)
+                except ValueError:
+                    raise HTTPException(400, "bg_blur must be true/false or an intensity 0-100")
+                if not 0 <= _n <= 100:
+                    raise HTTPException(400, "bg_blur intensity must be 0-100")
+                blur_on = _n > 0
+                blur_r = int(round(2 + (_n / 100.0) * 38))  # same mapping as /video/remove
             fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
             data = file.file.read()
             image_obj = self._open_image(data)
@@ -3174,8 +3464,7 @@ class Knockout:
             if round(target_w * ah / aw) != target_h:
                 target_w = int(round(target_h * aw / ah))
 
-            if bg_blur:
-                blur_r = max(1, min(int(blur_radius), 80))
+            if blur_on:
                 bg_full = rgb.copy().filter(ImageFilter.GaussianBlur(radius=blur_r))
                 bg_canvas = bg_full.resize((target_w, target_h), Image.LANCZOS)
             else:

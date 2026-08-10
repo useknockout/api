@@ -86,3 +86,16 @@ eval/cases/*/out/
 
 # session handoff protocol file — never commit
 HANDOFF.md
+
+# cross-AI (Claude <-> Codex) note mailbox — scratch, never commit
+.agent-handoff/
+
+# README rendering scratch (regenerated from README.md)
+_readme_body.html
+_readme_preview.html
+
+# machine-local Claude Code settings (skills + shared settings ARE tracked)
+.claude/settings.local.json
+
+
+v0.*
