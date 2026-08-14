@@ -34,7 +34,7 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 - **Fast** — ~200ms per image on a warm L4 GPU
 - **Cheap** — $0.02 per image pay-as-you-go (10x cheaper than remove.bg PAYG)
 - **Video too** — async video background removal with ProRes 4444 alpha output ($0.10/output-second)
-- **26 endpoints** — cutouts, masks, PSD export, upscale, face restore, inpaint, collage, studio shots, and more
+- **28 documented endpoints** — cutouts, masks, PSD export, upscale, face restore, inpaint, collage, studio shots, video, and more
 - **MIT licensed** — model weights and code, commercial use OK
 - **Self-hostable** — deploy to your own Modal workspace in one command
 
@@ -80,7 +80,7 @@ Input → Output:
 
 ## Quick start
 
-### Get your key — 10 images/month free, no card
+### Get your key — 30 images/month free, no card
 
 → **[useknockout.com/signin](https://useknockout.com/signin)**
 
@@ -241,7 +241,7 @@ curl https://useknockout--api.modal.run/health
 
 ## API reference
 
-The full endpoint-by-endpoint reference for all 26 endpoints, plus client examples for Python, Node.js, Go, and browser/TypeScript, lives in a dedicated doc:
+The full endpoint-by-endpoint reference for all 28 documented endpoints, plus client examples for Python, Node.js, Go, and browser/TypeScript, lives in a dedicated doc:
 
 → **[API reference & client examples](./APIREFERENCE.md)**
 
@@ -294,7 +294,7 @@ Run your own instance on Modal in one command. Full prerequisites, deploy steps,
                                 └───────────────────────────┘
 ```
 
-- **One file** (`main.py`), single Modal class, 26 endpoints + auto-generated docs
+- **One file** (`main.py`), single Modal class, 28 documented endpoints + auto-generated docs
 - **Weights baked into image** at build time — cold starts are just image pull + GPU model load (~25 s)
 - **FastAPI** handles multipart, JSON, CORS, OpenAPI schema generation
 
@@ -302,11 +302,11 @@ Run your own instance on Modal in one command. Full prerequisites, deploy steps,
 
 ## Pricing
 
-Sign up at **[useknockout.com/signin](https://useknockout.com/signin)** — 10 images/month free, no card.
+Sign up at **[useknockout.com/signin](https://useknockout.com/signin)** — 30 images/month free, no card.
 
 | Tier | Price | Best for |
 |---|---|---|
-| **Free** | 10 images / month, no card | Personal, eval, open source |
+| **Free** | 30 images / month, no card | Personal, eval, open source |
 | **Pay-as-you-go** | $0.02 / image | Side projects, early startups |
 | **Knockout Plus** | $10 / month, 250 images included, then $0.02 | Regular use + premium features |
 | **Volume** | $0.003 / image at 100k+/mo | Production workloads |
