@@ -2250,7 +2250,7 @@ class Knockout:
         def root():
             return {
                 "name": "useknockout",
-                "version": "0.12.0",
+                "version": "0.13.0",
                 "endpoints": [
                     "POST /remove",
                     "POST /remove-url",
