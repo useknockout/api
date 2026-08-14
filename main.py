@@ -109,8 +109,8 @@ DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP 
 #   mai     - Microsoft's own MAI image family, its own namespace. Model in BODY.
 #             {res}.services.ai.azure.com/mai/v1/images/generations
 AI_BG_AZURE_MODELS = {
-    "flux2-pro":           ("FLUX.2-pro", "foundry"),
-    "flux2-flex":          ("FLUX.2-flex", "foundry"),
+    "flux2-pro":           ("FLUX.2-pro", "bfl"),
+    "flux2-flex":          ("FLUX.2-flex", "bfl"),
     "flux1-kontext-pro":   ("FLUX.1-Kontext-pro", "foundry"),
     "gpt-image-2":         ("gpt-image-2", "aoai"),
     "mai-image-2e":        ("MAI-Image-2e", "mai"),
@@ -1499,7 +1499,22 @@ class Knockout:
 
         headers = {"Api-Key": key, "Content-Type": "application/json"}
         payload = {"prompt": prompt, "n": 1, "size": aspect}
-        if route == "aoai":
+        if route == "bfl":
+            # Black Forest Labs provider passthrough. FLUX.2 is sold directly by
+            # Azure but is NOT on the OpenAI-compatible image route — it 404s
+            # there. Own host, own path, model slug in the URL, Bearer auth,
+            # and width/height instead of `size`.
+            slug = deployment.lower().replace(".", "-")  # FLUX.2-pro -> flux-2-pro
+            # The docs show *.api.cognitive.microsoft.com, but that hostname does
+            # not resolve for this resource — the BFL passthrough lives on the
+            # same services.ai host as the other Foundry models.
+            host = self._azure_services_host(endpoint)
+            url = f"{host}/providers/blackforestlabs/v1/{slug}?api-version=preview"
+            headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+            w, h = (int(x) for x in aspect.split("x"))
+            payload = {"model": deployment, "prompt": prompt, "width": w, "height": h,
+                       "output_format": "jpeg"}
+        elif route == "aoai":
             url = (f"{endpoint}/openai/deployments/{deployment}"
                    f"/images/generations?api-version={AI_BG_API_VERSION}")
         elif route == "mai":
@@ -1519,7 +1534,14 @@ class Knockout:
                 502,
                 f"Background generation failed ({r.status_code}) [{route} {deployment}]: {r.text[:180]}",
             )
-        return self._decode_image_response(r.json())
+        body = r.json()
+        if route == "bfl":
+            # BFL returns its own envelope, not the OpenAI data[] shape.
+            found = self._find_image_in_json(body)
+            if found is None:
+                raise HTTPException(502, "Background generation returned no image")
+            return found
+        return self._decode_image_response(body)
 
     def _gen_bg_google(self, prompt: str, model: str, aspect: str) -> bytes:
         key = os.environ.get("GOOGLE_API_KEY") or ""
