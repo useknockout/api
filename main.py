@@ -75,8 +75,76 @@ DEMO_ENDPOINTS = frozenset({
     "/sticker",
     "/compare",
 })
-DEMO_MAX_DIM = 512                 # demo output capped to this longest side
+# Demo output cap. Was 512 after a token-abuse incident, but the public
+# playground runs on the demo key — so every visitor's first impression was a
+# 512px thumbnail upscaled in the browser, next to competitors showing full-res.
+# 1536 still bounds abuse (and the global daily cap is the real guard) while
+# looking like the product actually is. Override with DEMO_MAX_DIM env.
+DEMO_MAX_DIM = int(os.environ.get("DEMO_MAX_DIM", "") or 1536)
+
+# Signed-up free tier: images/month, no card. Raised 10 -> 30 on 2026-08-13 to
+# match withoutbg's "50 free" signup grant — except theirs is a ONE-TIME grant
+# that expires in 30 days and ours recurs every month and never expires, so at
+# 50 we are strictly more generous than the competitor we were being compared
+# against (their 50 is one-time and expires in 30 days; ours recurs).
+FREE_MONTHLY_QUOTA = int(os.environ.get("FREE_MONTHLY_QUOTA", "") or 30)
 DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP overrides
+
+# ---- /replace-bg-ai (AI-generated backgrounds) ----------------------------
+# EXPERIMENT, allowlist-gated. The generative model NEVER sees the product: we
+# cut the subject with BiRefNet, generate only the backdrop from a text prompt,
+# and composite. So product pixels are provably untouched and output stays at
+# source resolution — neither is true of generative image EDITING.
+#
+# Public model name -> Azure deployment name. Azure deployment names are chosen
+# at deploy time and need not match the catalog id, so every entry is
+# overridable by env (AI_BG_DEPLOYMENT_<UPPER_SNAKE>) — a wrong guess is a
+# secret edit, not a redeploy.
+# (deployment_name, route). Azure serves three different image APIs and picking
+# the wrong one 404s:
+#   aoai    - Azure OpenAI native models. Deployment in the PATH.
+#             {res}.openai.azure.com/openai/deployments/{dep}/images/generations
+#   foundry - "sold directly by Azure" partner models (BFL FLUX). Model in BODY.
+#             {res}.services.ai.azure.com/openai/v1/images/generations
+#   mai     - Microsoft's own MAI image family, its own namespace. Model in BODY.
+#             {res}.services.ai.azure.com/mai/v1/images/generations
+AI_BG_AZURE_MODELS = {
+    "flux2-pro":           ("FLUX.2-pro", "foundry"),
+    "flux2-flex":          ("FLUX.2-flex", "foundry"),
+    "flux1-kontext-pro":   ("FLUX.1-Kontext-pro", "foundry"),
+    "gpt-image-2":         ("gpt-image-2", "aoai"),
+    "mai-image-2e":        ("MAI-Image-2e", "mai"),
+    "mai-image-2.5":       ("MAI-Image-2.5", "mai"),
+    "mai-image-2.5-pro":   ("MAI-Image-2.5-Pro", "mai"),
+    "mai-image-2.5-flash": ("MAI-Image-2.5-Flash", "mai"),
+}
+AI_BG_GOOGLE_MODELS = {
+    "nano-banana": "gemini-2.5-flash-image",
+}
+# ASU AIML gateway — OWNER-ONLY, for free model evaluation. The token is Troy's
+# university work credential, so customer traffic must never touch it: these
+# models 403 for everyone except the internal is_legacy token, allowlist or not.
+# (The gateway strips image INPUTS, which is why this feature generates only the
+# backdrop from text — image-to-image evaluation there is impossible.)
+AI_BG_ASU_MODELS = {
+    "asu-gpt-image-2":  ("openai", "gpt_image2"),
+    "asu-nano-banana":  ("gcp-deepmind", "nano_banana_pro"),
+    "asu-gemini-flash": ("gcp-deepmind", "geminiflash2_5_image"),
+}
+AI_BG_ASU_URL = "https://api-main.aiml.asu.edu/query"
+AI_BG_DEFAULT_MODEL = os.environ.get("AI_BG_DEFAULT_MODEL", "flux2-pro").strip() or "flux2-pro"
+AI_BG_API_VERSION = os.environ.get("AI_BG_API_VERSION", "2025-04-01-preview")
+# Empty allowlist = feature OFF for everyone (the default). Comma-separated
+# Supabase user_ids enable it. The owner's internal token always passes.
+# Read at REQUEST time, not import time: Modal injects secret env vars into the
+# container, and module-level globals can evaluate before that lands. Reading
+# lazily also means adding a user is a secret edit with no redeploy.
+def _ai_bg_allowlist() -> frozenset:
+    return frozenset(
+        u.strip() for u in os.environ.get("AI_BG_ALLOWLIST", "").split(",") if u.strip()
+    )
+AI_BG_DAILY_CAP_DEFAULT = 50       # global calls/day; each one spends real provider money
+AI_BG_PROMPT_MAX = 500
 
 # ---- /video/remove (async jobs) ----
 VIDEO_MAX_SECONDS = 15             # hard cap per clip: 15s ProRes ~305MB stays under the 500MB storage limit; 30s would exceed it
@@ -288,7 +356,12 @@ app = modal.App(APP_NAME, image=image)
     scaledown_window=300,  # keep warm 5 min between requests
     timeout=1800,  # video jobs run inside the class (30s @ 30fps = 900 frames)
     max_containers=10,
-    secrets=[modal.Secret.from_name("knockout-secrets")],
+    secrets=[
+        modal.Secret.from_name("knockout-secrets"),
+        # AI-background provider creds. Separate secret so the experiment can be
+        # deleted in one command without touching production credentials.
+        modal.Secret.from_name("knockout-ai-bg", required_keys=[]),
+    ],
 )
 class Knockout:
     @modal.enter()
@@ -488,7 +561,7 @@ class Knockout:
                 status_code=402,
                 detail=(
                     "This key has been retired. Create a free account at "
-                    "useknockout.com/signin — 10 images/month free, no card, "
+                    "useknockout.com/signin — 30 images/month free, no card, "
                     "then pay-as-you-go at $0.05/image (4x cheaper than remove.bg)."
                 ),
             )
@@ -606,7 +679,7 @@ class Knockout:
                     detail=(
                         f"The shared demo key only supports {allowed} (low-res). "
                         "Create a free account at useknockout.com/signin for your "
-                        "own key — 10 full-quality images/month free across the "
+                        "own key — 30 full-quality images/month free across the "
                         "core endpoints, no card."
                     ),
                 )
@@ -650,7 +723,7 @@ class Knockout:
                     detail=(
                         "The shared demo key has hit today's global free limit. "
                         "Create a free account at useknockout.com/signin for your "
-                        "own key — 10 images/month free, no card, available now."
+                        "own key — 30 images/month free, no card, available now."
                     ),
                 )
             d[key] = used + 1
@@ -693,7 +766,7 @@ class Knockout:
         )
 
     def _enforce_quota(self, ctx: dict) -> None:
-        """Free tier: 10 images/month. Paid tiers: no monthly cap."""
+        """Free tier: FREE_MONTHLY_QUOTA images/month. Paid tiers: no cap."""
         if ctx.get("is_legacy"):
             return
         if ctx.get("tier") != "free":
@@ -716,10 +789,13 @@ class Knockout:
                 rows = json.loads(body)
                 if rows:
                     used = int(rows[0].get("call_count") or 0)
-                    if used >= 10:
+                    if used >= FREE_MONTHLY_QUOTA:
                         raise HTTPException(
                             status_code=402,
-                            detail="Free tier monthly quota (10) exhausted. Upgrade at useknockout.com/pricing.",
+                            detail=(
+                                f"Free tier monthly quota ({FREE_MONTHLY_QUOTA}) exhausted. "
+                                "It resets next month, or upgrade at useknockout.com/pricing."
+                            ),
                         )
             except (json.JSONDecodeError, ValueError, TypeError):
                 pass
@@ -1288,9 +1364,300 @@ class Knockout:
         result.putalpha(mask)
         return result
 
-    def _composite_on_bg(self, image_obj, bg_image_or_color, despill=None):
+    # ---- AI background generation (/replace-bg-ai) -----------------------
+
+    def _check_bg_model(self, model: str, ctx: dict) -> str:
+        m = (model or "auto").strip().lower()
+        if m == "auto":
+            m = AI_BG_DEFAULT_MODEL
+        known = set(AI_BG_AZURE_MODELS) | set(AI_BG_GOOGLE_MODELS) | set(AI_BG_ASU_MODELS)
+        if m not in known:
+            allowed = ", ".join(sorted(set(AI_BG_AZURE_MODELS) | set(AI_BG_GOOGLE_MODELS)))
+            raise HTTPException(400, f"model must be 'auto' or one of: {allowed}")
+        if m in AI_BG_ASU_MODELS and not ctx.get("is_legacy"):
+            # Owner-only. A university work token must never serve customer
+            # traffic, so this is refused even for allowlisted users.
+            raise HTTPException(403, "That model is not available on this account")
+        return m
+
+    @staticmethod
+    def _check_prompt(prompt: str) -> str:
+        p = (prompt or "").strip()
+        if not p:
+            raise HTTPException(400, "prompt is required")
+        if len(p) > AI_BG_PROMPT_MAX:
+            raise HTTPException(400, f"prompt must be {AI_BG_PROMPT_MAX} characters or fewer")
+        return p
+
+    def _require_ai_bg(self, ctx: dict) -> None:
+        """Allowlist gate for the AI-background experiment.
+
+        Empty AI_BG_ALLOWLIST = off for everyone, so shipping this code changes
+        nothing until a user_id is explicitly added. Turning it off later is a
+        secret edit, not a deploy, and no customer can come to depend on it.
+        """
+        if ctx.get("is_legacy"):
+            return
+        uid = str(ctx.get("user_id") or "")
+        if uid and uid in _ai_bg_allowlist():
+            return
+        raise HTTPException(
+            status_code=402,
+            detail="AI backgrounds are in limited preview. Contact support@useknockout.com for access.",
+        )
+
+    def _enforce_ai_bg_cap(self) -> None:
+        """Global daily cap — every call spends real money at the provider."""
+        try:
+            cap = int(os.environ.get("AI_BG_DAILY_CAP", "") or AI_BG_DAILY_CAP_DEFAULT)
+        except ValueError:
+            cap = AI_BG_DAILY_CAP_DEFAULT
+        day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        key = f"aibg-{day}"
+        try:
+            d = modal.Dict.from_name("knockout-stats", create_if_missing=True)
+            used = int(d.get(key, 0))
+            if used >= cap:
+                raise HTTPException(429, "AI background generation has hit today's global limit. Try again tomorrow.")
+            d[key] = used + 1
+        except HTTPException:
+            raise
+        except Exception:
+            pass  # counter is best-effort; never block on Dict failure
+
+    @staticmethod
+    def _bg_aspect(size) -> str:
+        """Nearest provider-supported size for the source aspect ratio.
+
+        The backdrop is scaled to cover the real frame afterwards, so it only
+        needs the right SHAPE — generating at 1-2MP never caps our output
+        resolution the way generative editing would.
+        """
+        w, h = size
+        r = w / float(h) if h else 1.0
+        if r >= 1.25:
+            return "1536x1024"
+        if r <= 0.8:
+            return "1024x1536"
+        return "1024x1024"
+
+    def _generate_background(self, prompt: str, model: str, size):
+        """Text-to-image backdrop, cached by (prompt, model, aspect).
+
+        The cache is the main cost lever: a caller running one prompt across a
+        20-image catalog pays for one generation, not twenty.
+        """
+        aspect = self._bg_aspect(size)
+        ckey = "aibg:" + hashlib.sha256(f"{model}|{aspect}|{prompt}".encode("utf-8")).hexdigest()
+        cache = None
+        try:
+            cache = modal.Dict.from_name("knockout-ai-bg-cache", create_if_missing=True)
+            hit = cache.get(ckey)
+            if hit:
+                return Image.open(io.BytesIO(base64.b64decode(hit))).convert("RGB")
+        except Exception:
+            cache = None  # cache is optional
+
+        if model in AI_BG_ASU_MODELS:
+            raw = self._gen_bg_asu(prompt, model)
+        elif model in AI_BG_GOOGLE_MODELS:
+            raw = self._gen_bg_google(prompt, AI_BG_GOOGLE_MODELS[model], aspect)
+        else:
+            raw = self._gen_bg_azure(prompt, model, aspect)
+
+        try:
+            if cache is not None:
+                cache[ckey] = base64.b64encode(raw).decode("ascii")
+        except Exception:
+            pass
+        return Image.open(io.BytesIO(raw)).convert("RGB")
+
+    @staticmethod
+    def _azure_services_host(aoai_endpoint: str) -> str:
+        """Derive the Foundry services host from the Azure OpenAI endpoint.
+
+        Same resource, different API surface:
+          https://ai-agents-os.openai.azure.com
+          https://ai-agents-os.services.ai.azure.com
+        Overridable via AZURE_FOUNDRY_SERVICES_ENDPOINT when they diverge.
+        """
+        override = (os.environ.get("AZURE_FOUNDRY_SERVICES_ENDPOINT") or "").rstrip("/")
+        if override:
+            return override
+        return aoai_endpoint.replace(".openai.azure.com", ".services.ai.azure.com")
+
+    def _gen_bg_azure(self, prompt: str, model: str, aspect: str) -> bytes:
+        endpoint = (os.environ.get("AZURE_FOUNDRY_ENDPOINT") or "").rstrip("/")
+        key = os.environ.get("AZURE_FOUNDRY_API_KEY") or ""
+        if not endpoint or not key:
+            raise HTTPException(503, "AI backgrounds are not configured on this deployment")
+        default_dep, route = AI_BG_AZURE_MODELS[model]
+        # Deployment names are chosen at deploy time and need not match the
+        # catalog id, so allow an env override per model.
+        env_name = "AI_BG_DEPLOYMENT_" + model.upper().replace("-", "_").replace(".", "_")
+        deployment = os.environ.get(env_name) or default_dep
+
+        headers = {"Api-Key": key, "Content-Type": "application/json"}
+        payload = {"prompt": prompt, "n": 1, "size": aspect}
+        if route == "aoai":
+            url = (f"{endpoint}/openai/deployments/{deployment}"
+                   f"/images/generations?api-version={AI_BG_API_VERSION}")
+        elif route == "mai":
+            url = f"{self._azure_services_host(endpoint)}/mai/v1/images/generations"
+            payload["model"] = deployment
+        else:  # foundry — partner models sold directly by Azure (BFL FLUX)
+            url = (f"{self._azure_services_host(endpoint)}"
+                   f"/openai/v1/images/generations?api-version=preview")
+            payload["model"] = deployment
+
+        try:
+            r = requests.post(url, headers=headers, json=payload, timeout=180)
+        except requests.RequestException as e:
+            raise HTTPException(502, f"Background generation failed: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(
+                502,
+                f"Background generation failed ({r.status_code}) [{route} {deployment}]: {r.text[:180]}",
+            )
+        return self._decode_image_response(r.json())
+
+    def _gen_bg_google(self, prompt: str, model: str, aspect: str) -> bytes:
+        key = os.environ.get("GOOGLE_API_KEY") or ""
+        if not key:
+            raise HTTPException(503, "AI backgrounds are not configured on this deployment")
+        url = (f"https://generativelanguage.googleapis.com/v1beta/models/"
+               f"{model}:generateContent?key={key}")
+        try:
+            r = requests.post(
+                url,
+                headers={"Content-Type": "application/json"},
+                json={"contents": [{"parts": [{"text": prompt}]}]},
+                timeout=120,
+            )
+        except requests.RequestException as e:
+            raise HTTPException(502, f"Background generation failed: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(502, f"Background generation failed ({r.status_code}): {r.text[:200]}")
+        body = r.json()
+        try:
+            for part in body["candidates"][0]["content"]["parts"]:
+                inline = part.get("inlineData") or part.get("inline_data")
+                if inline and inline.get("data"):
+                    return base64.b64decode(inline["data"])
+        except (KeyError, IndexError, TypeError):
+            pass
+        raise HTTPException(502, "Background generation returned no image")
+
+    def _gen_bg_asu(self, prompt: str, model: str) -> bytes:
+        """ASU AIML gateway (owner-only evaluation path).
+
+        Response envelope is not formally documented, so the image is located by
+        walking the JSON for the first b64 blob or image URL rather than
+        assuming a key path.
+        """
+        token = os.environ.get("ASU_AIML_TOKEN") or ""
+        project = os.environ.get("ASU_AIML_PROJECT_ID") or ""
+        if not token or not project:
+            raise HTTPException(503, "ASU evaluation models are not configured on this deployment")
+        provider, name = AI_BG_ASU_MODELS[model]
+        try:
+            r = requests.post(
+                AI_BG_ASU_URL,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+                json={
+                    "endpoint": "image",
+                    "request_source": "override_params",
+                    "query": prompt,
+                    "model_provider": provider,
+                    "model_name": name,
+                    "project_id": project,
+                    "enable_history": False,
+                    "response_format": {"type": "json"},
+                },
+                timeout=180,
+            )
+        except requests.RequestException as e:
+            raise HTTPException(502, f"Background generation failed: {e}")
+        if r.status_code >= 400:
+            raise HTTPException(502, f"Background generation failed ({r.status_code}): {r.text[:200]}")
+        found = self._find_image_in_json(r.json())
+        if found is None:
+            raise HTTPException(502, "Background generation returned no image")
+        return found
+
+    def _find_image_in_json(self, node, depth: int = 0):
+        """Walk an unknown JSON envelope for image bytes (b64 blob or URL)."""
+        if depth > 8:
+            return None
+        if isinstance(node, str):
+            if node.startswith("http") and len(node) < 2000:
+                try:
+                    ir = requests.get(node, timeout=60)
+                    ir.raise_for_status()
+                    if ir.headers.get("content-type", "").startswith("image/"):
+                        return ir.content
+                except requests.RequestException:
+                    return None
+                return None
+            if len(node) > 500:
+                s = node.split(",", 1)[-1] if node.startswith("data:") else node
+                try:
+                    raw = base64.b64decode(s, validate=True)
+                except Exception:
+                    return None
+                return raw if raw[:4] in (b"\x89PNG", b"\xff\xd8\xff\xe0", b"\xff\xd8\xff\xe1", b"RIFF") or raw[:3] == b"\xff\xd8\xff" else None
+            return None
+        if isinstance(node, dict):
+            for v in node.values():
+                got = self._find_image_in_json(v, depth + 1)
+                if got:
+                    return got
+        elif isinstance(node, list):
+            for v in node:
+                got = self._find_image_in_json(v, depth + 1)
+                if got:
+                    return got
+        return None
+
+    @staticmethod
+    def _decode_image_response(body: dict) -> bytes:
+        """Pull image bytes out of an OpenAI-shaped images response.
+
+        Providers return either inline b64 or a short-lived URL depending on
+        model and version, so handle both rather than assuming one.
+        """
+        try:
+            item = body["data"][0]
+        except (KeyError, IndexError, TypeError):
+            raise HTTPException(502, "Background generation returned no image")
+        b64 = item.get("b64_json")
+        if b64:
+            return base64.b64decode(b64)
+        url = item.get("url")
+        if url:
+            try:
+                ir = requests.get(url, timeout=60)
+                ir.raise_for_status()
+                return ir.content
+            except requests.RequestException as e:
+                raise HTTPException(502, f"Could not fetch generated background: {e}")
+        raise HTTPException(502, "Background generation returned no image")
+
+    @staticmethod
+    def _cover_resize(bg, size):
+        """Scale-and-center-crop the backdrop to exactly `size` (no distortion)."""
+        tw, th = size
+        bw, bh = bg.size
+        scale = max(tw / float(bw), th / float(bh))
+        nw, nh = max(1, int(round(bw * scale))), max(1, int(round(bh * scale)))
+        bg = bg.resize((nw, nh), Image.LANCZOS)
+        left, top = (nw - tw) // 2, (nh - th) // 2
+        return bg.crop((left, top, left + tw, top + th))
+
+    def _composite_on_bg(self, image_obj, bg_image_or_color, despill=None,
+                         detect: str = "standard", decontaminate: bool = False):
         """Composite foreground onto a solid color or image background."""
-        rgb, mask = self._get_mask(image_obj)
+        rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
         clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
         if isinstance(bg_image_or_color, tuple):
             bg = bg_image_or_color  # solid color — scalar fast path in _composite_linear
@@ -1889,6 +2256,7 @@ class Knockout:
                     "POST /remove-url",
                     "POST /psd",
                     "POST /replace-bg",
+                    "POST /replace-bg-ai",
                     "POST /remove-batch",
                     "POST /remove-batch-url",
                     "POST /mask",
@@ -1949,6 +2317,7 @@ class Knockout:
         # endpoint, append to POST_ONLY_INFO and the GET handler appears.
         POST_ONLY_INFO = {
             "/replace-bg": ("multipart 'file' + 'bg_color' hex OR 'bg_url'", "client.replaceBackground({ file, bgColor: '#FFFFFF' })"),
+            "/replace-bg-ai": ("multipart 'file' + 'prompt' + optional 'model' (limited preview)", "curl -F file=@p.jpg -F prompt='marble counter' .../replace-bg-ai"),
             "/remove-batch": ("multipart 'files' (1..10 images)", "client.removeBatch({ files: ['./a.jpg', './b.jpg'] })"),
             "/remove-batch-url": ("JSON { urls: string[1..10], format }", "client.removeBatchUrl({ urls: ['https://...'] })"),
             "/mask": ("multipart 'file' — returns grayscale alpha matte", "client.mask({ file })"),
@@ -2286,6 +2655,80 @@ class Knockout:
                 height=height, watermark=watermark, watermark_opacity=watermark_opacity,
             )
             self._end(ctx, "/replace-bg", _t)
+            return resp
+
+        @web.post("/replace-bg-ai")
+        def replace_bg_ai_endpoint(
+            file: UploadFile = File(...),
+            prompt: str = Form(...),
+            model: str = Form("auto"),
+            format: str = Form("jpg"),
+            detect: str = Form("standard"),
+            decontaminate: bool = Form(False),
+            quality: Optional[int] = Form(None),
+            max_dim: Optional[int] = Form(None),
+            width: Optional[int] = Form(None),
+            height: Optional[int] = Form(None),
+            despill: Optional[float] = Form(None),
+            watermark: Optional[str] = Form(None),
+            watermark_opacity: float = Form(0.5),
+            authorization: Optional[str] = Header(default=None),
+        ):
+            """
+            Replace the background with an AI-generated scene from a text prompt.
+
+            LIMITED PREVIEW — allowlist only.
+
+            The generative model never sees your product. We cut the subject out
+            with BiRefNet, generate only the backdrop from `prompt`, then
+            composite. So product pixels are unchanged and output stays at source
+            resolution — unlike generative image editing, which repaints the
+            whole frame and caps resolution.
+
+            `prompt`: scene description, e.g. "white marble countertop, soft
+                window light from the left". Max 500 characters.
+            `model`: `auto` (default) or an explicit backend —
+                flux2-pro, flux2-flex, flux1-kontext-pro, gpt-image-2,
+                mai-image-2e, mai-image-2.5, mai-image-2.5-pro,
+                mai-image-2.5-flash, nano-banana.
+            `detect` / `decontaminate`: same as /remove; they control the cutout,
+                not the backdrop.
+
+            Backdrops are cached by (prompt, model, aspect), so running one
+            prompt across a catalog generates once.
+            """
+            ctx, _t = self._begin(authorization, "/replace-bg-ai")
+            self._require_ai_bg(ctx)
+            prompt = self._check_prompt(prompt)
+            model = self._check_bg_model(model, ctx)
+            detect = self._check_detect(detect)
+            if detect == "high_recall":
+                self._require_paid_compute(ctx, "detect=high_recall")
+            if despill is not None or watermark:
+                self._require_pro(ctx, "Premium output (despill, watermark)")
+            fmt = self._check_format(format, allowed=frozenset({"png", "webp", "jpg"}))
+
+            data = file.file.read()
+            fg = self._open_image(data)
+            self._enforce_ai_bg_cap()
+
+            bg = self._generate_background(prompt, model, fg.size)
+            bg = self._cover_resize(bg, fg.size)
+            composited = self._composite_on_bg(
+                fg, bg, despill=despill, detect=detect, decontaminate=decontaminate,
+            )
+
+            resp = self._finalize_response(
+                composited, fmt, quality=quality, max_dim=max_dim, width=width,
+                height=height, watermark=watermark, watermark_opacity=watermark_opacity,
+            )
+            # LIMITED PREVIEW: usage row still written (so we can see volume and
+            # who used it), but NO Stripe meter fires — provider cost is
+            # $0.02-0.19 per background, well above any current per-image price,
+            # so charging the normal rate would lose money on every call. Troy
+            # absorbs the experiment. Remove skip_meter and add a dedicated
+            # meter/price before this leaves preview.
+            self._end(ctx, "/replace-bg-ai", _t, skip_meter=True)
             return resp
 
         @web.post("/remove-batch")
