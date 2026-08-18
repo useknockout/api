@@ -2936,6 +2936,7 @@ class Knockout:
             format: str = Form("png"),
             detect: str = Form("standard"),
             decontaminate: bool = Form(False),
+            engine: str = Form("standard"),
             authorization: Optional[str] = Header(default=None),
         ):
             """
@@ -2948,13 +2949,19 @@ class Knockout:
             """
             ctx, _t = self._begin(authorization, "/smart-crop")
             detect = self._check_detect(detect)
+            engine = self._check_engine(engine)
             if detect == "high_recall":
                 self._require_paid_compute(ctx, "detect=high_recall")
+            if engine == "product-v1":
+                self._require_paid_compute(ctx, "engine=product-v1")
             allowed = frozenset({"png", "webp", "jpg"}) if not transparent else frozenset({"png", "webp"})
             fmt = self._check_format(format, allowed=allowed)
             data = file.file.read()
             image_obj = self._open_image(data)
-            rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+            if engine == "product-v1":
+                rgb, mask = self._product_mask(image_obj)
+            else:
+                rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
 
             bbox = self._bounding_box(mask)
             if bbox is None:
@@ -3248,6 +3255,7 @@ class Knockout:
             preset: Optional[str] = Form(None),
             detect: str = Form("standard"),
             decontaminate: bool = Form(False),
+            engine: str = Form("standard"),
             authorization: Optional[str] = Header(default=None),
         ):
             """
@@ -3265,8 +3273,11 @@ class Knockout:
             status_code = 200
             try:
                 detect = self._check_detect(detect)
+                engine = self._check_engine(engine)
                 if detect == "high_recall":
                     self._require_paid_compute(ctx, "detect=high_recall")
+                if engine == "product-v1":
+                    self._require_paid_compute(ctx, "engine=product-v1")
                 if despill is not None or watermark or preset:
                     self._require_pro(ctx, "Premium output (despill, watermark, presets)")
                 if preset:
@@ -3283,7 +3294,10 @@ class Knockout:
                     fmt = "png"  # jpg can't carry alpha — coerce to a lossless alpha format
                 data = file.file.read()
                 image_obj = self._open_image(data)
-                rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+                if engine == "product-v1":
+                    rgb, mask = self._product_mask(image_obj)
+                else:
+                    rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
 
                 try:
                     aw_str, ah_str = aspect.split(":")
