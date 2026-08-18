@@ -350,6 +350,73 @@ with image.imports():
 
 app = modal.App(APP_NAME, image=image)
 
+# ---- product-v1 engine (S3OD + CascadePSP), isolated container ------------
+#
+# Alternate cutout engine for flat product photography (lightbox flat-lays,
+# e-commerce sheets). S3OD (okupyn/s3od, MIT) produces the coarse mask;
+# CascadePSP (segmentation-refinement, MIT) refines it at native resolution.
+# Chosen over BiRefNet for this domain in the 2026-08-17 bakeoff — see
+# docs/superpowers/specs/2026-08-17-white-halo-problem.md and
+# eval/cases/kravento-film/.
+#
+# Lives in its OWN image + container: its torch 2.6 stack must not touch the
+# main image's torch 2.4 / numpy 1.26 pins (basicsr/pymatting/modelscope all
+# depend on those), and isolation keeps cold starts, VRAM and rollbacks of the
+# experiment separate from every existing endpoint.
+product_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .apt_install("git", "libgl1", "libglib2.0-0")
+    .pip_install(
+        "torch==2.6.0",
+        "torchvision==0.21.0",
+        "transformers>=4.48",
+        "timm",
+        "einops",
+        "safetensors",
+        "huggingface_hub",
+        "pillow",
+        "numpy",
+        "opencv-python-headless",
+    )
+    .pip_install("segmentation-refinement")
+    .pip_install("git+https://github.com/KupynOrest/s3od.git")
+)
+
+
+@app.cls(gpu="L4", scaledown_window=300, timeout=600, image=product_image)
+class ProductEngine:
+    @modal.enter()
+    def load(self):
+        from s3od import BackgroundRemoval
+        import segmentation_refinement as refine
+
+        self.det = BackgroundRemoval(model_id="okupyn/s3od")
+        self.refiner = refine.Refiner(device="cuda")
+
+    @modal.method()
+    def cutout(self, image_png: bytes) -> bytes:
+        """RGB image bytes in, native-resolution grayscale alpha PNG out."""
+        import io
+        import cv2
+        import numpy as np
+        from PIL import Image as PILImage
+
+        im = PILImage.open(io.BytesIO(image_png)).convert("RGB")
+        res = self.det.remove_background(im)
+        arr = np.squeeze(np.asarray(res.predicted_mask))
+        if arr.max() <= 1.5:
+            arr = (arr * 255).clip(0, 255).astype("uint8")
+        else:
+            arr = arr.astype("uint8")
+        alpha = PILImage.fromarray(arr)
+        if alpha.size != im.size:
+            alpha = alpha.resize(im.size, PILImage.LANCZOS)
+        bgr = cv2.cvtColor(np.asarray(im), cv2.COLOR_RGB2BGR)
+        refined = self.refiner.refine(bgr, np.asarray(alpha), fast=False, L=900)
+        buf = io.BytesIO()
+        PILImage.fromarray(refined).save(buf, format="PNG")
+        return buf.getvalue()
+
 
 @app.cls(
     gpu="L4",
@@ -1187,6 +1254,33 @@ class Knockout:
             raise HTTPException(400, "detect must be 'standard' or 'high_recall'")
         return d
 
+    def _check_engine(self, engine: str) -> str:
+        e = (engine or "standard").strip().lower()
+        if e not in ("standard", "product-v1"):
+            raise HTTPException(400, "engine must be 'standard' or 'product-v1'")
+        return e
+
+    def _product_mask(self, image_obj):
+        """Cutout via the isolated ProductEngine container (S3OD + CascadePSP).
+
+        Cross-container call: adds ~1-2s warm, a cold start on first use. The
+        refinement pass alone runs 15-20s on a 12MP image, which is why this
+        engine is opt-in and gated to paid tiers rather than a default.
+        """
+        import io as _io
+        rgb = image_obj.convert("RGB")
+        buf = _io.BytesIO()
+        rgb.save(buf, format="PNG")
+        try:
+            mask_png = ProductEngine().cutout.remote(buf.getvalue())
+        except Exception as e:
+            print(f"product engine failed: {e!r}")
+            raise HTTPException(502, "product engine unavailable, retry or use engine=standard")
+        mask = Image.open(_io.BytesIO(mask_png)).convert("L")
+        if mask.size != rgb.size:
+            mask = mask.resize(rgb.size, Image.LANCZOS)
+        return rgb, mask
+
     def _require_paid_compute(self, ctx: dict, feature: str = "This mode") -> None:
         """Gate 2x-inference modes to paying tiers. 402 for demo/free.
 
@@ -1355,8 +1449,12 @@ class Knockout:
         return rgb, mask
 
     def _remove(self, image_obj, despill=None, edge: str = "soft", detect: str = "standard",
-                decontaminate: bool = False):
-        rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+                decontaminate: bool = False, engine: str = "standard"):
+        if engine == "product-v1":
+            # detect/decontaminate are BiRefNet-path knobs; ignored here by design.
+            rgb, mask = self._product_mask(image_obj)
+        else:
+            rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
         if edge == "hard":
             mask = self._harden_alpha(mask)
         clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
@@ -2246,6 +2344,7 @@ class Knockout:
             edge: str = "soft"
             detect: str = "standard"
             decontaminate: bool = False
+            engine: str = "standard"
             quality: Optional[int] = None
             max_dim: Optional[int] = None
             width: Optional[int] = None
@@ -2479,6 +2578,7 @@ class Knockout:
             edge: str = Form("soft"),
             detect: str = Form("standard"),
             decontaminate: bool = Form(False),
+            engine: str = Form("standard"),
             watermark: Optional[str] = Form(None),
             watermark_opacity: float = Form(0.5),
             preset: Optional[str] = Form(None),
@@ -2499,12 +2599,15 @@ class Knockout:
             fmt = self._check_format(format)
             edge = self._check_edge(edge)
             detect = self._check_detect(detect)
+            engine = self._check_engine(engine)
             if detect == "high_recall":
                 self._require_paid_compute(ctx, "detect=high_recall")
+            if engine == "product-v1":
+                self._require_paid_compute(ctx, "engine=product-v1")
             data = file.file.read()
             image_obj = self._open_image(data)
             result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
-                                  decontaminate=decontaminate)
+                                  decontaminate=decontaminate, engine=engine)
             if ctx.get("is_demo"):
                 result = self._downscale_max(result, DEMO_MAX_DIM)
                 # Resize params could upscale right past the demo cap — drop them.
@@ -2541,8 +2644,11 @@ class Knockout:
             # detect must 400 without us making a network request or image work.
             edge = self._check_edge(body.edge)
             detect = self._check_detect(body.detect)
+            engine = self._check_engine(body.engine)
             if detect == "high_recall":
                 self._require_paid_compute(ctx, "detect=high_recall")
+            if engine == "product-v1":
+                self._require_paid_compute(ctx, "engine=product-v1")
 
             try:
                 resp = requests.get(str(body.url), timeout=15)
@@ -2552,7 +2658,7 @@ class Knockout:
 
             image_obj = self._open_image(resp.content)
             result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
-                                  decontaminate=body.decontaminate)
+                                  decontaminate=body.decontaminate, engine=engine)
             out_resp = self._finalize_response(
                 result, fmt, quality=quality, max_dim=max_dim, width=width,
                 height=height, watermark=watermark, watermark_opacity=body.watermark_opacity,
@@ -2800,14 +2906,21 @@ class Knockout:
         def mask_endpoint(
             file: UploadFile = File(...),
             format: str = Form("png"),
+            engine: str = Form("standard"),
             authorization: Optional[str] = Header(default=None),
         ):
             """Return just the alpha mask as a grayscale PNG/WebP (0 = bg, 255 = subject)."""
             ctx, _t = self._begin(authorization, "/mask")
             fmt = self._check_format(format)
+            engine = self._check_engine(engine)
+            if engine == "product-v1":
+                self._require_paid_compute(ctx, "engine=product-v1")
             data = file.file.read()
             image_obj = self._open_image(data)
-            _, mask = self._get_mask(image_obj)
+            if engine == "product-v1":
+                _, mask = self._product_mask(image_obj)
+            else:
+                _, mask = self._get_mask(image_obj)
             out = mask.convert("L")
             if ctx.get("is_demo"):
                 out = self._downscale_max(out, DEMO_MAX_DIM)
