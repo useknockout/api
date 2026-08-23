@@ -1256,9 +1256,74 @@ class Knockout:
 
     def _check_engine(self, engine: str) -> str:
         e = (engine or "standard").strip().lower()
-        if e not in ("standard", "product-v1"):
-            raise HTTPException(400, "engine must be 'standard' or 'product-v1'")
+        if e not in ("standard", "product-v1", "auto"):
+            raise HTTPException(400, "engine must be 'standard', 'product-v1', or 'auto'")
         return e
+
+    # engine=auto routing thresholds. Tuned 2026-08-21 on the default-engine
+    # masks in eval/cases/ (see the table in the docstring of _auto_should_escalate).
+    AUTO_MAX_COMPLEXITY = 40.0   # perimeter^2 / area
+    AUTO_MAX_THIN_LOSS = 0.08    # fraction of subject lost to erosion
+
+    def _auto_should_escalate(self, rgb, mask) -> Tuple[bool, dict]:
+        """Decide whether the default result warrants a product-v1 rerun.
+
+        Measured on the DEFAULT engine's own mask, so the decision is about the
+        result we already have rather than a guess about the photo.
+
+        Two shape signals, both scale-normalised. Values measured on our eval
+        set (default-engine masks), escalate-worthy on the left:
+
+            film-white 15.8 / 0.047   flower-pale 110.2 / 0.119
+            film-tan   16.0 / 0.047   foliage     114.3 / 0.117
+            shoe       16.1 / 0.038   hair        122.4 / 0.091
+            dog        24.7 / 0.053   chain       514.0 / 0.231
+
+        Flat opaque products cluster under 25; anything with fur, foliage or
+        thin structure sits above 110. Thresholds sit in that 4x gap.
+
+        NOTE: an edge-band "does this look like background" halo score was tried
+        here first and REJECTED — it scored flower 0.638 and chain 0.643 against
+        film 0.28-0.31, i.e. backwards. Shape separates cleanly; colour does not.
+
+        Bias is deliberate: when in doubt, do not escalate. A missed escalation
+        is the behaviour customers already had; a wrong escalation can delete
+        pale foliage (verified 2026-08-19, eval/cases/flower-pale-leaves/).
+        """
+        try:
+            from scipy import ndimage
+        except ImportError:
+            return False, {"reason": "scipy unavailable"}
+        m = np.asarray(mask.convert("L")) > 128
+        area = int(m.sum())
+        if area < 5000:
+            return False, {"reason": "subject too small", "area": area}
+        perim = int((m & ~ndimage.binary_erosion(m, iterations=1)).sum())
+        complexity = (perim ** 2) / area
+        r = max(2, int(0.012 * (area ** 0.5)))
+        thin_loss = 1.0 - (ndimage.binary_erosion(m, iterations=r).sum() / area)
+        esc = complexity < self.AUTO_MAX_COMPLEXITY and thin_loss < self.AUTO_MAX_THIN_LOSS
+        return esc, {"complexity": round(float(complexity), 1),
+                     "thin_loss": round(float(thin_loss), 3)}
+
+    def _acquire_mask_auto(self, image_obj, detect: str, decontaminate: bool):
+        """engine=auto: default mask, escalate to product-v1 only if it fits.
+
+        Returns (rgb, mask, engine_used). Never raises on product-v1 failure —
+        falls back to the default result we already computed, so auto cannot be
+        worse than standard.
+        """
+        rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+        esc, sig = self._auto_should_escalate(rgb, mask)
+        print(f"engine=auto: escalate={esc} {sig}")
+        if not esc:
+            return rgb, mask, "standard"
+        try:
+            rgb2, mask2 = self._product_mask(image_obj)
+            return rgb2, mask2, "product-v1"
+        except Exception as e:
+            print(f"engine=auto: product-v1 failed, keeping default result: {e!r}")
+            return rgb, mask, "standard"
 
     def _product_mask(self, image_obj):
         """Cutout via the isolated ProductEngine container (S3OD + CascadePSP).
@@ -1453,6 +1518,8 @@ class Knockout:
         if engine == "product-v1":
             # detect/decontaminate are BiRefNet-path knobs; ignored here by design.
             rgb, mask = self._product_mask(image_obj)
+        elif engine == "auto":
+            rgb, mask, _used = self._acquire_mask_auto(image_obj, detect, decontaminate)
         else:
             rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
         if edge == "hard":
@@ -2602,8 +2669,8 @@ class Knockout:
             engine = self._check_engine(engine)
             if detect == "high_recall":
                 self._require_paid_compute(ctx, "detect=high_recall")
-            if engine == "product-v1":
-                self._require_paid_compute(ctx, "engine=product-v1")
+            if engine in ("product-v1", "auto"):
+                self._require_paid_compute(ctx, f"engine={engine}")
             data = file.file.read()
             image_obj = self._open_image(data)
             result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
@@ -2647,8 +2714,8 @@ class Knockout:
             engine = self._check_engine(body.engine)
             if detect == "high_recall":
                 self._require_paid_compute(ctx, "detect=high_recall")
-            if engine == "product-v1":
-                self._require_paid_compute(ctx, "engine=product-v1")
+            if engine in ("product-v1", "auto"):
+                self._require_paid_compute(ctx, f"engine={engine}")
 
             try:
                 resp = requests.get(str(body.url), timeout=15)
@@ -2913,12 +2980,14 @@ class Knockout:
             ctx, _t = self._begin(authorization, "/mask")
             fmt = self._check_format(format)
             engine = self._check_engine(engine)
-            if engine == "product-v1":
-                self._require_paid_compute(ctx, "engine=product-v1")
+            if engine in ("product-v1", "auto"):
+                self._require_paid_compute(ctx, f"engine={engine}")
             data = file.file.read()
             image_obj = self._open_image(data)
             if engine == "product-v1":
                 _, mask = self._product_mask(image_obj)
+            elif engine == "auto":
+                _, mask, _ = self._acquire_mask_auto(image_obj, "standard", False)
             else:
                 _, mask = self._get_mask(image_obj)
             out = mask.convert("L")
@@ -2952,14 +3021,16 @@ class Knockout:
             engine = self._check_engine(engine)
             if detect == "high_recall":
                 self._require_paid_compute(ctx, "detect=high_recall")
-            if engine == "product-v1":
-                self._require_paid_compute(ctx, "engine=product-v1")
+            if engine in ("product-v1", "auto"):
+                self._require_paid_compute(ctx, f"engine={engine}")
             allowed = frozenset({"png", "webp", "jpg"}) if not transparent else frozenset({"png", "webp"})
             fmt = self._check_format(format, allowed=allowed)
             data = file.file.read()
             image_obj = self._open_image(data)
             if engine == "product-v1":
                 rgb, mask = self._product_mask(image_obj)
+            elif engine == "auto":
+                rgb, mask, _ = self._acquire_mask_auto(image_obj, detect, decontaminate)
             else:
                 rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
 
@@ -3276,8 +3347,8 @@ class Knockout:
                 engine = self._check_engine(engine)
                 if detect == "high_recall":
                     self._require_paid_compute(ctx, "detect=high_recall")
-                if engine == "product-v1":
-                    self._require_paid_compute(ctx, "engine=product-v1")
+                if engine in ("product-v1", "auto"):
+                    self._require_paid_compute(ctx, f"engine={engine}")
                 if despill is not None or watermark or preset:
                     self._require_pro(ctx, "Premium output (despill, watermark, presets)")
                 if preset:
@@ -3296,6 +3367,8 @@ class Knockout:
                 image_obj = self._open_image(data)
                 if engine == "product-v1":
                     rgb, mask = self._product_mask(image_obj)
+                elif engine == "auto":
+                    rgb, mask, _ = self._acquire_mask_auto(image_obj, detect, decontaminate)
                 else:
                     rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
 
