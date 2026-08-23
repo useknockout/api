@@ -89,6 +89,8 @@ DEMO_MAX_DIM = int(os.environ.get("DEMO_MAX_DIM", "") or 1536)
 # against (their 50 is one-time and expires in 30 days; ours recurs).
 FREE_MONTHLY_QUOTA = int(os.environ.get("FREE_MONTHLY_QUOTA", "") or 30)
 DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP overrides
+DEMO_IP_DAILY_CAP_DEFAULT = 10     # per-IP anonymous calls/day; DEMO_IP_DAILY_CAP overrides
+DEMO_IP_SALT = os.environ.get("DEMO_IP_SALT", "knockout-demo-ip-v1")  # raw IPs never stored
 
 # ---- /replace-bg-ai (AI-generated backgrounds) ----------------------------
 # EXPERIMENT, allowlist-gated. The generative model NEVER sees the product: we
@@ -303,6 +305,10 @@ image = (
     # can't silently bump them (it pulls pillow 12.x + numpy 2.x otherwise) and
     # break pymatting/PIL.
     .pip_install("psd-tools>=1.11,<2", "numpy==1.26.4", "pillow==10.4.0")
+    # PyJWT + cryptography for the web-app portal credential (Path 1.5 in
+    # _check_auth): verifies Supabase session JWTs (ES256) against the
+    # project's JWKS endpoint. No shared JWT secret is stored anywhere.
+    .pip_install("pyjwt==2.9.0", "cryptography==43.0.1")
     # basicsr 1.4.2 + facexlib import `torchvision.transforms.functional_tensor`,
     # removed in torchvision 0.17+. Patch every file in site-packages that
     # references it. Uses grep to find files (no Python import — would crash).
@@ -325,7 +331,7 @@ with image.imports():
     import requests
     import torch
     from basicsr.archs.rrdbnet_arch import RRDBNet
-    from fastapi import FastAPI, File, Form, Header, HTTPException, UploadFile
+    from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
     from fastapi.middleware.cors import CORSMiddleware
     from fastapi.responses import Response
     from gfpgan import GFPGANer
@@ -658,6 +664,14 @@ class Knockout:
         if presented in legacy_set:
             return {"user_id": None, "token_id": None, "tier": "free", "is_legacy": True}
 
+        # Path 1.5: portal session credential from the web app.
+        # Format: knoportal.<token_row_uuid>.<supabase access JWT (ES256)>
+        # The browser never holds a plaintext kno_* key; it proves identity with
+        # the user's Supabase session JWT, and the token row id names WHICH of
+        # their keys to act as. Ownership is enforced in the lookup query.
+        if presented.startswith("knoportal."):
+            return self._check_portal_auth(presented[len("knoportal."):])
+
         # Path 2: per-user kno_* token. SHA-256 hashed lookup.
         if not presented.startswith("kno_"):
             raise HTTPException(status_code=401, detail="Invalid token format")
@@ -683,7 +697,64 @@ class Knockout:
         if not rows:
             raise HTTPException(status_code=401, detail="Invalid or revoked token")
 
-        row = rows[0]
+        return self._ctx_from_token_row(rows[0])
+
+    _jwks_client = None  # class-level PyJWKClient cache (fetches Supabase JWKS once per container)
+
+    def _check_portal_auth(self, rest: str) -> dict:
+        """Verify a knoportal.<key_id>.<jwt> credential. See Path 1.5 above.
+
+        JWT verification is asymmetric (ES256 via the project's JWKS endpoint,
+        confirmed live 2026-08-23) — no shared secret enters this codebase.
+        """
+        key_id, _, jwt_token = rest.partition(".")
+        if not key_id or not jwt_token or "." not in jwt_token:
+            raise HTTPException(status_code=401, detail="Invalid portal credential format")
+        try:
+            import jwt as pyjwt
+            from jwt import PyJWKClient
+            if Knockout._jwks_client is None:
+                jwks_url = os.environ["SUPABASE_URL"].rstrip("/") + "/auth/v1/.well-known/jwks.json"
+                Knockout._jwks_client = PyJWKClient(jwks_url, cache_keys=True)
+            signing_key = Knockout._jwks_client.get_signing_key_from_jwt(jwt_token)
+            payload = pyjwt.decode(
+                jwt_token, signing_key.key,
+                algorithms=["ES256"], audience="authenticated",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"portal auth: JWT verification failed: {type(e).__name__}")
+            raise HTTPException(status_code=401, detail="Invalid or expired portal session")
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid portal session")
+
+        # Ownership enforced in the query: the key row must belong to the JWT's user.
+        status, body = self._supabase_request(
+            "GET",
+            "/rest/v1/tokens",
+            params={
+                "select": "id,user_id,scopes,revoked_at",
+                "id": f"eq.{key_id}",
+                "user_id": f"eq.{sub}",
+                "revoked_at": "is.null",
+                "limit": "1",
+            },
+        )
+        if status != 200:
+            raise HTTPException(status_code=503, detail="Auth service unavailable")
+        try:
+            rows = json.loads(body) if body else []
+        except json.JSONDecodeError:
+            rows = []
+        if not rows:
+            raise HTTPException(status_code=401, detail="Portal key not found or revoked")
+        return self._ctx_from_token_row(rows[0])
+
+    def _ctx_from_token_row(self, row: dict) -> dict:
+        """Token row → TokenContext. Shared by the raw-key and portal paths so
+        tier resolution can never diverge between them."""
         token_id = row["id"]
         user_id = row["user_id"]
         scopes = row.get("scopes") or []
@@ -794,6 +865,31 @@ class Knockout:
                     ),
                 )
             d[key] = used + 1
+
+            # Per-IP daily cap, on top of the global one. Requested by the
+            # web-app session (2026-08-23): the demo key is public and CORS is
+            # open, so browser-side throttles are decoration — only this
+            # server-side counter is real. IPs are salted-hashed, never stored.
+            ip = (ctx.get("client_ip") or "").strip()
+            if ip:
+                try:
+                    ip_cap = int(os.environ.get("DEMO_IP_DAILY_CAP", "")
+                                 or DEMO_IP_DAILY_CAP_DEFAULT)
+                except ValueError:
+                    ip_cap = DEMO_IP_DAILY_CAP_DEFAULT
+                iph = hashlib.sha256((DEMO_IP_SALT + ip).encode("utf-8")).hexdigest()[:16]
+                ip_key = f"demo-ip:{day}:{iph}"
+                ip_used = int(d.get(ip_key, 0))
+                if ip_used >= ip_cap:
+                    raise HTTPException(
+                        status_code=429,
+                        detail=(
+                            "Daily free limit reached for this connection. "
+                            "Sign in at useknockout.com/signin for your own key — "
+                            "30 images/month free, no card."
+                        ),
+                    )
+                d[ip_key] = ip_used + 1
         except HTTPException:
             raise
         except Exception:
@@ -918,9 +1014,16 @@ class Knockout:
         if 200 <= status < 300 and not skip_meter and ctx.get("tier") in {"payg", "volume", "pro"}:
             self._report_meter(ctx, units=units, event_name=meter_event)
 
-    def _begin(self, authorization: Optional[str], endpoint: str) -> Tuple[dict, float]:
-        """One call → auth + scope + quota + start timer. Use at top of each handler."""
+    def _begin(self, authorization: Optional[str], endpoint: str,
+               client_ip: Optional[str] = None) -> Tuple[dict, float]:
+        """One call → auth + scope + quota + start timer. Use at top of each handler.
+
+        client_ip: first-hop X-Forwarded-For, passed only by endpoints that
+        enforce the per-IP demo cap (currently /remove). Never stored raw.
+        """
         ctx = self._check_auth(authorization)
+        if client_ip:
+            ctx["client_ip"] = client_ip
         self._check_endpoint_access(ctx, endpoint)
         self._check_scope(ctx, endpoint)
         self._enforce_demo_limit(ctx)
@@ -2650,8 +2753,12 @@ class Knockout:
             watermark_opacity: float = Form(0.5),
             preset: Optional[str] = Form(None),
             authorization: Optional[str] = Header(default=None),
+            request: Request = None,
         ):
-            ctx, _t = self._begin(authorization, "/remove")
+            # Modal strips client-sent X-Forwarded-For (verified 2026-08-23) and
+            # exposes the true client address on request.client — unspoofable.
+            client_ip = request.client.host if (request and request.client) else None
+            ctx, _t = self._begin(authorization, "/remove", client_ip=client_ip)
             if despill is not None or watermark or preset:
                 self._require_pro(ctx, "Premium output (despill, watermark, presets)")
             if preset:
@@ -2929,7 +3036,7 @@ class Knockout:
         @web.post("/remove-batch")
         def remove_batch_endpoint(
             files: List[UploadFile] = File(...),
-            format: str = "png",
+            format: str = Form("png"),  # was a bare str = query param; every other option is Form
             authorization: Optional[str] = Header(default=None),
         ):
             """

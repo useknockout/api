@@ -642,8 +642,9 @@ func removeBG(path, token string) ([]byte, error) {
 ### cURL — WebP output (smaller files)
 
 ```bash
-curl -X POST "https://useknockout--api.modal.run/remove?format=webp" \
+curl -X POST "https://useknockout--api.modal.run/remove" \
   -H "Authorization: Bearer $TOKEN" \
   -F "file=@input.jpg" \
+  -F "format=webp" \
   -o output.webp
 ```
