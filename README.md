@@ -36,7 +36,7 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 - **Video too** — async video background removal with ProRes 4444 alpha output ($0.10/output-second)
 - **28 documented endpoints** — cutouts, masks, PSD export, upscale, face restore, inpaint, collage, studio shots, video, and more
 - **MIT licensed** — model weights and code, commercial use OK
-- **Self-hostable** — deploy to your own Modal workspace in one command
+
 
   
 *Works alpha-preserving (PNG with transparent bg) OR opaque (solid color / remote image as new bg).*
@@ -50,7 +50,6 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 - [Quick start](#quick-start)
 - [API reference](./APIREFERENCE.md)
 - [Benchmarks](#benchmarks)
-- [Self-hosting](./SELFHOSTING.md)
 - [Architecture](#architecture)
 - [Pricing](#pricing)
 - [License](#license)
@@ -63,7 +62,7 @@ A production-grade background removal API powered by [BiRefNet](https://github.c
 
 Drag an image in, pick an operation, get the result back. It runs the live API. Also available as a [Hugging Face Space](https://huggingface.co/spaces/tlorents/useknockout-demo).
 
-**Full docs (endpoints, SDKs, self-hosting):** [useknockout.com/docs](https://useknockout.com/docs)
+**Full docs (endpoints, SDKs):** [useknockout.com/docs](https://useknockout.com/docs)
 
 **Base URL (for code):** `https://useknockout--api.modal.run`
 
