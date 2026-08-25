@@ -92,6 +92,28 @@ DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP 
 DEMO_IP_DAILY_CAP_DEFAULT = 10     # per-IP anonymous calls/day; DEMO_IP_DAILY_CAP overrides
 DEMO_IP_SALT = os.environ.get("DEMO_IP_SALT", "knockout-demo-ip-v1")  # raw IPs never stored
 
+# CascadePSP's fast=False path refines in ~900px tiles at NATIVE resolution and
+# fuses them. A tile landing entirely inside a large flat region (the inside of
+# an open box, a plain backdrop panel) carries no boundary evidence, so some
+# tiles flip to background and the fused alpha comes back with grid-shaped
+# holes. Kravento hit this on a 3072px box on 2026-08-25: 8 interior holes,
+# 13.6% of the subject destroyed. The SAME image at 1280px is spotless — the
+# bug is purely a function of pixel dimensions. Cap what the refiner sees, then
+# upscale the alpha back. 1600 still localises edges far better than the 1024
+# default-engine mask, which is where the halo win came from in the first place.
+# 900 == the refiner's own tile size. Anything larger tiles and can seam; 1600
+# was tried first and still left 7.9% of the box interior semi-transparent.
+PRODUCT_REFINE_MAX_DIM = int(os.environ.get("PRODUCT_REFINE_MAX_DIM", "") or 900)
+# Refinement may legitimately shrink a boundary; it must never punch a hole
+# through the middle of the subject. Measured away from the edge, so ordinary
+# boundary tightening cannot trip it.
+PRODUCT_REFINE_MAX_INTERIOR_LOSS = 0.01
+# engine=auto only: product-v1 must not be WORSE than the default mask it is
+# replacing. Auto already computes the default first, so it can compare and
+# keep the default when escalation backfires. Shape routing cannot see damage;
+# this can. 1% of the subject interior going transparent is the limit.
+AUTO_MAX_PRODUCT_REGRESSION = 0.01
+
 # ---- /replace-bg-ai (AI-generated backgrounds) ----------------------------
 # EXPERIMENT, allowlist-gated. The generative model NEVER sees the product: we
 # cut the subject with BiRefNet, generate only the backdrop from a text prompt,
@@ -417,10 +439,53 @@ class ProductEngine:
         alpha = PILImage.fromarray(arr)
         if alpha.size != im.size:
             alpha = alpha.resize(im.size, PILImage.LANCZOS)
-        bgr = cv2.cvtColor(np.asarray(im), cv2.COLOR_RGB2BGR)
-        refined = self.refiner.refine(bgr, np.asarray(alpha), fast=False, L=900)
+
+        # ---- guard 1: never let the refiner tile ------------------------
+        # See PRODUCT_REFINE_MAX_DIM. Refine small, then scale the alpha back.
+        longest = max(im.size)
+        if longest > PRODUCT_REFINE_MAX_DIM:
+            s = PRODUCT_REFINE_MAX_DIM / float(longest)
+            small = (max(1, int(round(im.width * s))), max(1, int(round(im.height * s))))
+            im_r = im.resize(small, PILImage.LANCZOS)
+            alpha_r = alpha.resize(small, PILImage.LANCZOS)
+            print(f"product engine: refining at {small} (native {im.size})")
+        else:
+            im_r, alpha_r = im, alpha
+
+        bgr = cv2.cvtColor(np.asarray(im_r), cv2.COLOR_RGB2BGR)
+        refined = self.refiner.refine(bgr, np.asarray(alpha_r), fast=False, L=900)
+        refined_img = PILImage.fromarray(refined)
+        if refined_img.size != im.size:
+            refined_img = refined_img.resize(im.size, PILImage.LANCZOS)
+
+        # ---- guard 2: refinement must not eat the subject ---------------
+        # Independent of guard 1 on purpose: if some future image tiles badly
+        # anyway, we ship the unrefined S3OD mask rather than a holed cutout.
+        try:
+            from scipy import ndimage
+
+            # Compare CONTINUOUS alpha, not a >128 threshold. The tile seams
+            # come back at ~50% alpha, which a binary test scores as "kept"
+            # while the pixel is visibly half gone. That mistake is why a 7.9%
+            # semi-transparent wash was first reported as fixed.
+            base = np.asarray(alpha).astype(np.float32) / 255.0
+            ref = np.asarray(refined_img).astype(np.float32) / 255.0
+            solid = ndimage.binary_fill_holes(base > 0.5)
+            # ignore a boundary band; only interior losses count
+            band = max(4, int(0.004 * max(im.size)))
+            interior = ndimage.binary_erosion(solid, iterations=band)
+            if interior.any():
+                drop = (base - ref)[interior]
+                lost = float((drop > 0.2).sum()) / float(interior.sum())
+                if lost > PRODUCT_REFINE_MAX_INTERIOR_LOSS:
+                    print(f"product engine: refinement made {lost:.1%} of the "
+                          f"subject interior transparent - DISCARDED, unrefined mask")
+                    refined_img = alpha
+        except Exception as e:  # a broken guard must never fail the request
+            print(f"product engine: interior guard skipped ({e!r})")
+
         buf = io.BytesIO()
-        PILImage.fromarray(refined).save(buf, format="PNG")
+        refined_img.save(buf, format="PNG")
         return buf.getvalue()
 
 
@@ -1365,7 +1430,15 @@ class Knockout:
 
     # engine=auto routing thresholds. Tuned 2026-08-21 on the default-engine
     # masks in eval/cases/ (see the table in the docstring of _auto_should_escalate).
-    AUTO_MAX_COMPLEXITY = 40.0   # perimeter^2 / area
+    # Tightened 40 -> 22 on 2026-08-25. Measured on every default-engine mask
+    # we hold: products cluster at 15.7-19.3 (Kravento film 15.7, shoe 16.1,
+    # flowerbox 17.0-18.3, Kravento box 19.3) and the first case we do NOT want
+    # to escalate is a golden retriever at 24.7 — product-v1 keeps its fur but
+    # hardens the edge (feathered pixels 16.6k -> 5.0k), which reads as a cutout
+    # on an animal. 22 sits in the empty gap between the two clusters. Erring
+    # low is the safe direction: a missed escalation is a halo, an unwanted one
+    # can damage the subject.
+    AUTO_MAX_COMPLEXITY = 22.0   # perimeter^2 / area
     AUTO_MAX_THIN_LOSS = 0.08    # fraction of subject lost to erosion
 
     def _auto_should_escalate(self, rgb, mask) -> Tuple[bool, dict]:
@@ -1423,10 +1496,34 @@ class Knockout:
             return rgb, mask, "standard"
         try:
             rgb2, mask2 = self._product_mask(image_obj)
-            return rgb2, mask2, "product-v1"
         except Exception as e:
             print(f"engine=auto: product-v1 failed, keeping default result: {e!r}")
             return rgb, mask, "standard"
+
+        # Shape said "product", but shape cannot see whether product-v1 damaged
+        # the subject. We already hold the default mask, so compare them: any
+        # region the default kept solid and product-v1 made transparent is a
+        # regression, not a refinement. Kravento's gold box is exactly this
+        # case (complexity 19.3 - reads as a product, comes back holed).
+        # Continuous alpha, not a >128 test: the damage arrives at ~50%.
+        try:
+            from scipy import ndimage as _ndi
+
+            a_def = np.asarray(mask.convert("L")).astype(np.float32) / 255.0
+            a_prd = np.asarray(mask2.convert("L").resize(mask.size)).astype(np.float32) / 255.0
+            solid = _ndi.binary_fill_holes(a_def > 0.5)
+            band = max(4, int(0.004 * max(mask.size)))
+            interior = _ndi.binary_erosion(solid, iterations=band)
+            if interior.any():
+                worse = float(((a_def - a_prd)[interior] > 0.2).sum()) / float(interior.sum())
+                if worse > AUTO_MAX_PRODUCT_REGRESSION:
+                    print(f"engine=auto: product-v1 made {worse:.1%} of the subject "
+                          f"transparent vs default - REJECTED, using standard")
+                    return rgb, mask, "standard"
+        except Exception as e:
+            print(f"engine=auto: regression check skipped ({e!r})")
+
+        return rgb2, mask2, "product-v1"
 
     def _product_mask(self, image_obj):
         """Cutout via the isolated ProductEngine container (S3OD + CascadePSP).
@@ -1617,14 +1714,19 @@ class Knockout:
         return rgb, mask
 
     def _remove(self, image_obj, despill=None, edge: str = "soft", detect: str = "standard",
-                decontaminate: bool = False, engine: str = "standard"):
+                decontaminate: bool = False, engine: str = "standard", info=None):
+        """info: optional dict; receives {"engine": <engine that actually ran>}."""
         if engine == "product-v1":
             # detect/decontaminate are BiRefNet-path knobs; ignored here by design.
             rgb, mask = self._product_mask(image_obj)
+            used = "product-v1"
         elif engine == "auto":
-            rgb, mask, _used = self._acquire_mask_auto(image_obj, detect, decontaminate)
+            rgb, mask, used = self._acquire_mask_auto(image_obj, detect, decontaminate)
         else:
             rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+            used = "standard"
+        if info is not None:
+            info["engine"] = used
         if edge == "hard":
             mask = self._harden_alpha(mask)
         clean_rgb = self._clean_foreground(rgb, mask, strength=self._despill_strength(despill))
@@ -2205,9 +2307,10 @@ class Knockout:
             image_out.save(buf, format="PNG", optimize=True)
         return buf.getvalue()
 
-    def _response(self, image_out, fmt: str, quality: Optional[int] = None):
+    def _response(self, image_out, fmt: str, quality: Optional[int] = None, headers=None):
         content = self._encode(image_out, fmt, quality=quality)
-        return Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt])
+        return Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt],
+                        headers=headers or None)
 
     def _apply_resize(self, image_obj, max_dim=None, width=None, height=None):
         """Resize output. Precedence: explicit width/height over max_dim.
@@ -2278,9 +2381,20 @@ class Knockout:
         image_obj = self._apply_watermark(image_obj, watermark, watermark_opacity)
         return self._encode(image_obj, fmt, quality=quality)
 
-    def _finalize_response(self, image_obj, fmt: str, **kw):
+    def _finalize_response(self, image_obj, fmt: str, headers=None, **kw):
         content = self._finalize(image_obj, fmt, **kw)
-        return Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt])
+        return Response(content=content, media_type=self._FORMAT_TO_MEDIA[fmt],
+                        headers=headers or None)
+
+    @staticmethod
+    def _engine_headers(engine_used: str) -> dict:
+        """Tell the caller which cutout engine actually ran.
+
+        Only interesting when engine=auto, where the routing decision is ours
+        and the caller cannot predict it. Emitted on every engine-aware
+        endpoint so clients can log or display it without branching.
+        """
+        return {"x-knockout-engine": engine_used or "standard"}
 
     # Output knobs a saved preset may set as defaults. Restricted to params
     # whose endpoint default is None, so an explicit request value can always
@@ -2780,8 +2894,9 @@ class Knockout:
                 self._require_paid_compute(ctx, f"engine={engine}")
             data = file.file.read()
             image_obj = self._open_image(data)
+            _info = {}
             result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
-                                  decontaminate=decontaminate, engine=engine)
+                                  decontaminate=decontaminate, engine=engine, info=_info)
             if ctx.get("is_demo"):
                 result = self._downscale_max(result, DEMO_MAX_DIM)
                 # Resize params could upscale right past the demo cap — drop them.
@@ -2789,6 +2904,7 @@ class Knockout:
             resp = self._finalize_response(
                 result, fmt, quality=quality, max_dim=max_dim, width=width,
                 height=height, watermark=watermark, watermark_opacity=watermark_opacity,
+                headers=self._engine_headers(_info.get("engine")),
             )
             self._end(ctx, "/remove", _t)
             return resp
@@ -2831,11 +2947,13 @@ class Knockout:
                 raise HTTPException(400, f"Could not fetch image: {e}")
 
             image_obj = self._open_image(resp.content)
+            _info = {}
             result = self._remove(image_obj, despill=despill, edge=edge, detect=detect,
-                                  decontaminate=body.decontaminate, engine=engine)
+                                  decontaminate=body.decontaminate, engine=engine, info=_info)
             out_resp = self._finalize_response(
                 result, fmt, quality=quality, max_dim=max_dim, width=width,
                 height=height, watermark=watermark, watermark_opacity=body.watermark_opacity,
+                headers=self._engine_headers(_info.get("engine")),
             )
             self._end(ctx, "/remove-url", _t)
             return out_resp
@@ -3093,14 +3211,16 @@ class Knockout:
             image_obj = self._open_image(data)
             if engine == "product-v1":
                 _, mask = self._product_mask(image_obj)
+                used = "product-v1"
             elif engine == "auto":
-                _, mask, _ = self._acquire_mask_auto(image_obj, "standard", False)
+                _, mask, used = self._acquire_mask_auto(image_obj, "standard", False)
             else:
                 _, mask = self._get_mask(image_obj)
+                used = "standard"
             out = mask.convert("L")
             if ctx.get("is_demo"):
                 out = self._downscale_max(out, DEMO_MAX_DIM)
-            resp = self._response(out, fmt)
+            resp = self._response(out, fmt, headers=self._engine_headers(used))
             self._end(ctx, "/mask", _t)
             return resp
 
@@ -3136,10 +3256,12 @@ class Knockout:
             image_obj = self._open_image(data)
             if engine == "product-v1":
                 rgb, mask = self._product_mask(image_obj)
+                used = "product-v1"
             elif engine == "auto":
-                rgb, mask, _ = self._acquire_mask_auto(image_obj, detect, decontaminate)
+                rgb, mask, used = self._acquire_mask_auto(image_obj, detect, decontaminate)
             else:
                 rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+                used = "standard"
 
             bbox = self._bounding_box(mask)
             if bbox is None:
@@ -3161,7 +3283,7 @@ class Knockout:
             else:
                 cropped = rgb.crop((left, top, right, bottom))
 
-            resp = self._response(cropped, fmt)
+            resp = self._response(cropped, fmt, headers=self._engine_headers(used))
             self._end(ctx, "/smart-crop", _t)
             return resp
 
@@ -3474,10 +3596,12 @@ class Knockout:
                 image_obj = self._open_image(data)
                 if engine == "product-v1":
                     rgb, mask = self._product_mask(image_obj)
+                    used = "product-v1"
                 elif engine == "auto":
-                    rgb, mask, _ = self._acquire_mask_auto(image_obj, detect, decontaminate)
+                    rgb, mask, used = self._acquire_mask_auto(image_obj, detect, decontaminate)
                 else:
                     rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+                    used = "standard"
 
                 try:
                     aw_str, ah_str = aspect.split(":")
@@ -3565,6 +3689,7 @@ class Knockout:
                 resp = self._finalize_response(
                     composed, fmt, quality=quality, max_dim=max_dim, width=width,
                     height=height, watermark=watermark, watermark_opacity=watermark_opacity,
+                    headers=self._engine_headers(used),
                 )
                 return resp
             except HTTPException as e:
