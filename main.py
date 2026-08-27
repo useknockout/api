@@ -1080,14 +1080,21 @@ class Knockout:
             self._report_meter(ctx, units=units, event_name=meter_event)
 
     def _begin(self, authorization: Optional[str], endpoint: str,
-               client_ip: Optional[str] = None) -> Tuple[dict, float]:
+               client_ip: Optional[str] = None,
+               forwarded_ip: Optional[str] = None) -> Tuple[dict, float]:
         """One call → auth + scope + quota + start timer. Use at top of each handler.
 
-        client_ip: first-hop X-Forwarded-For, passed only by endpoints that
-        enforce the per-IP demo cap (currently /remove). Never stored raw.
+        client_ip: the socket peer (request.client.host) — unspoofable.
+        forwarded_ip: X-Knockout-Client-IP, sent by our own web proxies for
+        logged-out demo traffic. Trusted ONLY when the caller authenticated
+        with the demo key: the demo token is server-held now, so the sender is
+        our proxy, and a spoofed value is still bounded by the global daily
+        cap. On any other tier it is ignored. Never stored raw.
         """
         ctx = self._check_auth(authorization)
-        if client_ip:
+        if forwarded_ip and ctx.get("is_demo"):
+            ctx["client_ip"] = forwarded_ip.split(",")[0].strip()
+        elif client_ip:
             ctx["client_ip"] = client_ip
         self._check_endpoint_access(ctx, endpoint)
         self._check_scope(ctx, endpoint)
@@ -2872,7 +2879,16 @@ class Knockout:
             # Modal strips client-sent X-Forwarded-For (verified 2026-08-23) and
             # exposes the true client address on request.client — unspoofable.
             client_ip = request.client.host if (request and request.client) else None
-            ctx, _t = self._begin(authorization, "/remove", client_ip=client_ip)
+            # The web app's logged-out demo now calls through a Vercel server
+            # proxy, so request.client is Vercel's egress IP — every anonymous
+            # user would share one per-IP bucket. The proxy forwards the real
+            # user address in X-Knockout-Client-IP. Honoured ONLY on the
+            # demo-key path (see _enforce_demo_limit): on raw keys and
+            # knoportal the header means nothing, and a spoofed value on the
+            # demo path is still bounded by the global daily cap.
+            forwarded_ip = request.headers.get("x-knockout-client-ip") if request else None
+            ctx, _t = self._begin(authorization, "/remove", client_ip=client_ip,
+                                  forwarded_ip=forwarded_ip)
             if despill is not None or watermark or preset:
                 self._require_pro(ctx, "Premium output (despill, watermark, presets)")
             if preset:
