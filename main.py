@@ -60,6 +60,15 @@ MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB
 FREE_TIER_ENDPOINTS = frozenset({
     "/remove",
     "/remove-url",
+    # Widened 2026-08-27 (Troy): the free tier now covers the five headline
+    # tools, not just remove. All are single-inference calls, so the 30/month
+    # quota bounds cost the same as before. /mask kept: it was already free,
+    # and taking an endpoint away from existing free users is the kind of
+    # silent breakage the backward-compat rule exists to prevent.
+    "/sticker",
+    "/replace-bg",
+    "/headshot",
+    "/smart-crop",
     "/mask",
     "/compare",
     "/preview",
@@ -3033,6 +3042,7 @@ class Knockout:
             file: UploadFile = File(...),
             bg_color: str = Form("#FFFFFF"),
             bg_url: Optional[str] = Form(None),
+            bg_file: Optional[UploadFile] = File(None),
             format: str = Form("png"),
             quality: Optional[int] = Form(None),
             max_dim: Optional[int] = Form(None),
@@ -3047,9 +3057,12 @@ class Knockout:
             """
             Remove the background and composite the subject onto a new background.
 
-            Provide either:
+            Provide one of:
               - bg_color: hex color (default #FFFFFF). Examples: "#000000", "#ff5733".
               - bg_url: URL of a background image (takes precedence over bg_color).
+              - bg_file: background image uploaded as a multipart file (added
+                2026-08-27 for the web workspace, where the background is a
+                local file with nowhere to host it). Takes precedence over both.
 
             Output is opaque (no alpha). Use `format=jpg` for smallest file size.
             """
@@ -3070,7 +3083,10 @@ class Knockout:
             data = file.file.read()
             fg = self._open_image(data)
 
-            if bg_url:
+            if bg_file is not None and getattr(bg_file, "filename", None):
+                bg = self._open_image(bg_file.file.read())
+                composited = self._composite_on_bg(fg, bg, despill=despill)
+            elif bg_url:
                 try:
                     bg_resp = requests.get(bg_url, timeout=15)
                     bg_resp.raise_for_status()
