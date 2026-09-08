@@ -101,6 +101,35 @@ DEMO_DAILY_CAP_DEFAULT = 500       # global anonymous calls/day; DEMO_DAILY_CAP 
 DEMO_IP_DAILY_CAP_DEFAULT = 10     # per-IP anonymous calls/day; DEMO_IP_DAILY_CAP overrides
 DEMO_IP_SALT = os.environ.get("DEMO_IP_SALT", "knockout-demo-ip-v1")  # raw IPs never stored
 
+# Guest Workspace (2026-09-06): a signed-out visitor gets a Supabase ANONYMOUS
+# session and presents `Bearer knoguest.<jwt>`. Lifetime allowance per anonymous
+# user (keyed on the JWT `sub`), counted only on success so a failed upstream
+# or a retry never burns an edit. Guests reuse the demo-key gating (endpoint
+# allowlist, 1536px output, global daily pool, per-IP signal); this is the one
+# extra limit on top. Reachable ONLY via the knoguest. prefix — raw keys,
+# knoportal and the public demo key never enter this path.
+# 5, not 10 (Troy, 2026-09-07): 10 is more than a no-account visitor needs to
+# judge the product, and the allowance resets when site data is cleared anyway.
+# Must match GUEST_EDITS in the web app's lib/workspace/tools.ts or the header
+# and the server disagree partway through.
+GUEST_LIFETIME_EDITS = int(os.environ.get("GUEST_LIFETIME_EDITS", "") or 5)
+import contextvars as _contextvars
+# Per-request holder so a middleware can stamp x-knockout-guest-remaining on
+# every response (2xx and 402 alike) without each handler knowing about it.
+# The middleware creates the dict; the endpoint thread mutates it; contextvars
+# copied into the threadpool share the same dict object.
+_GUEST_STATE: "_contextvars.ContextVar" = _contextvars.ContextVar("kno_guest_state", default=None)
+
+
+class GuestQuotaExceeded(Exception):
+    """Raised at _begin when an anonymous user has spent their lifetime edits.
+
+    Rendered by an exception handler as 402 with a TOP-LEVEL `code` field, which
+    is what the web app keys on (it discards `detail`).
+    """
+    detail = "Guest edits used up. Create a free account for 30 free images a month."
+    code = "guest_quota"
+
 # CascadePSP's fast=False path refines in ~900px tiles at NATIVE resolution and
 # fuses them. A tile landing entirely inside a large flat region (the inside of
 # an open box, a plain backdrop panel) carries no boundary evidence, so some
@@ -746,6 +775,13 @@ class Knockout:
         if presented.startswith("knoportal."):
             return self._check_portal_auth(presented[len("knoportal."):])
 
+        # Path 1.6: guest credential from the web app's signed-out Workspace.
+        # Format: knoguest.<supabase ANONYMOUS session JWT (ES256)>
+        # Same JWKS verification as Path 1.5; the JWT must carry
+        # is_anonymous=true. No token row, no users row, no key is ever minted.
+        if presented.startswith("knoguest."):
+            return self._check_guest_auth(presented[len("knoguest."):])
+
         # Path 2: per-user kno_* token. SHA-256 hashed lookup.
         if not presented.startswith("kno_"):
             raise HTTPException(status_code=401, detail="Invalid token format")
@@ -774,6 +810,56 @@ class Knockout:
         return self._ctx_from_token_row(rows[0])
 
     _jwks_client = None  # class-level PyJWKClient cache (fetches Supabase JWKS once per container)
+
+    def _check_guest_auth(self, jwt_token: str) -> dict:
+        """Verify a knoguest.<anonymous jwt> credential. See Path 1.6 above.
+
+        Guests are demo-tier plus a lifetime allowance. A NON-anonymous JWT
+        presented here is refused outright rather than downgraded to free: the
+        web app has a proper path for signed-in users (knoportal) and a signed
+        in session arriving on this path means a client bug, not a guest.
+        """
+        if not jwt_token or "." not in jwt_token:
+            raise HTTPException(status_code=401, detail="Invalid guest credential format")
+        try:
+            import jwt as pyjwt
+            from jwt import PyJWKClient
+            if Knockout._jwks_client is None:
+                jwks_url = os.environ["SUPABASE_URL"].rstrip("/") + "/auth/v1/.well-known/jwks.json"
+                Knockout._jwks_client = PyJWKClient(jwks_url, cache_keys=True)
+            signing_key = Knockout._jwks_client.get_signing_key_from_jwt(jwt_token)
+            payload = pyjwt.decode(
+                jwt_token, signing_key.key,
+                algorithms=["ES256"], audience="authenticated",
+            )
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"guest auth: JWT verification failed: {type(e).__name__}")
+            raise HTTPException(status_code=401, detail="Invalid or expired guest session")
+        sub = payload.get("sub")
+        if not sub:
+            raise HTTPException(status_code=401, detail="Invalid guest session")
+        if payload.get("is_anonymous") is not True:
+            raise HTTPException(status_code=401, detail="Not a guest session")
+        return {
+            "user_id": None,
+            "token_id": None,
+            "tier": "guest",
+            "is_legacy": True,   # keeps guests out of the per-user usage table + monthly quota
+            "is_demo": True,     # demo gating: DEMO_ENDPOINTS, 1536px, global pool, per-IP
+            "is_guest": True,
+            "guest_sub": sub,
+        }
+
+    def _guest_used(self, sub: str) -> int:
+        d = modal.Dict.from_name("knockout-stats", create_if_missing=True)
+        return int(d.get(f"guest:{sub}", 0))
+
+    def _guest_set_remaining(self, remaining: int) -> None:
+        st = _GUEST_STATE.get()
+        if isinstance(st, dict):
+            st["remaining"] = max(0, int(remaining))
 
     def _check_portal_auth(self, rest: str) -> dict:
         """Verify a knoportal.<key_id>.<jwt> credential. See Path 1.5 above.
@@ -944,7 +1030,16 @@ class Knockout:
             # web-app session (2026-08-23): the demo key is public and CORS is
             # open, so browser-side throttles are decoration — only this
             # server-side counter is real. IPs are salted-hashed, never stored.
-            ip = (ctx.get("client_ip") or "").strip()
+            #
+            # GUESTS ARE EXEMPT (2026-09-07). A knoguest. caller is already
+            # bounded by GUEST_LIFETIME_EDITS keyed on their anonymous user id,
+            # which is a tighter and more accurate bound than an IP. Leaving
+            # them in meant the per-IP counter tripped first: the web-app's
+            # real browser pass saw 429 on the 10th guest call, so a guest on
+            # one address could never reach their own quota wall, and two
+            # guests behind one household or office NAT would starve each
+            # other. The global daily pool below still bounds the worst case.
+            ip = "" if ctx.get("is_guest") else (ctx.get("client_ip") or "").strip()
             if ip:
                 try:
                     ip_cap = int(os.environ.get("DEMO_IP_DAILY_CAP", "")
@@ -1101,15 +1196,32 @@ class Knockout:
         cap. On any other tier it is ignored. Never stored raw.
         """
         ctx = self._check_auth(authorization)
-        if forwarded_ip and ctx.get("is_demo"):
+        # Forwarded IP is trusted only on the server-held demo-key path. A guest
+        # calls the API straight from the browser, so request.client IS the
+        # real address and a client-sent header would be spoofable.
+        if forwarded_ip and ctx.get("is_demo") and not ctx.get("is_guest"):
             ctx["client_ip"] = forwarded_ip.split(",")[0].strip()
         elif client_ip:
             ctx["client_ip"] = client_ip
         self._check_endpoint_access(ctx, endpoint)
         self._check_scope(ctx, endpoint)
+        if ctx.get("is_guest"):
+            self._enforce_guest_limit(ctx)
         self._enforce_demo_limit(ctx)
         self._enforce_quota(ctx)
         return ctx, time.perf_counter()
+
+    def _enforce_guest_limit(self, ctx: dict) -> None:
+        """Lifetime allowance per anonymous user. Checked here, spent in _end on 2xx."""
+        try:
+            used = self._guest_used(ctx["guest_sub"])
+        except Exception as e:  # stats store hiccup: fail open, the global pool still bounds it
+            print(f"guest limit: stats read failed ({type(e).__name__}); allowing")
+            return
+        remaining = GUEST_LIFETIME_EDITS - used
+        self._guest_set_remaining(remaining)
+        if remaining <= 0:
+            raise GuestQuotaExceeded()
 
     def _end(self, ctx: dict, endpoint: str, start: float, status: int = 200, units: int = 1,
              meter_event: Optional[str] = None, skip_meter: bool = False) -> None:
@@ -1119,6 +1231,18 @@ class Knockout:
         meter_event / skip_meter: see _log_usage (PSD add-on + Plus exemption).
         """
         latency_ms = int((time.perf_counter() - start) * 1000)
+        if ctx.get("is_guest") and 200 <= int(status) < 300:
+            # Spend one guest edit only on success. Read-modify-write; a small
+            # overshoot under true concurrency is acceptable and bounded by the
+            # global anonymous daily pool.
+            try:
+                d = modal.Dict.from_name("knockout-stats", create_if_missing=True)
+                key = f"guest:{ctx['guest_sub']}"
+                used = int(d.get(key, 0)) + 1
+                d[key] = used
+                self._guest_set_remaining(GUEST_LIFETIME_EDITS - used)
+            except Exception as e:
+                print(f"guest limit: stats write failed ({type(e).__name__})")
         self._log_usage(ctx, endpoint, status, latency_ms, units=units,
                         meter_event=meter_event, skip_meter=skip_meter)
 
@@ -2636,7 +2760,32 @@ class Knockout:
             allow_origins=["*"],
             allow_methods=["POST", "GET", "DELETE"],
             allow_headers=["*"],
+            # Browsers cannot read custom response headers cross-origin unless
+            # they are exposed. The web app reads both of these from fetch().
+            expose_headers=["x-knockout-engine", "x-knockout-guest-remaining"],
         )
+
+        from starlette.requests import Request as _StarletteRequest
+        from starlette.responses import JSONResponse as _JSONResponse
+
+        @web.middleware("http")
+        async def _guest_remaining_header(request: _StarletteRequest, call_next):
+            # See _GUEST_STATE: the endpoint thread fills `remaining` for guest
+            # calls; we stamp it on whatever response comes back, including the
+            # 402 raised when the allowance is spent.
+            holder: dict = {}
+            token = _GUEST_STATE.set(holder)
+            try:
+                response = await call_next(request)
+            finally:
+                _GUEST_STATE.reset(token)
+            if "remaining" in holder:
+                response.headers["x-knockout-guest-remaining"] = str(holder["remaining"])
+            return response
+
+        @web.exception_handler(GuestQuotaExceeded)
+        async def _guest_quota_handler(request: _StarletteRequest, exc: GuestQuotaExceeded):
+            return _JSONResponse(status_code=402, content={"detail": exc.detail, "code": exc.code})
 
         class UrlBody(BaseModel):
             url: HttpUrl

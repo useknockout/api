@@ -1,0 +1,352 @@
+<title>Knockout Layers</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&family=Bebas+Neue&family=Playfair+Display:wght@700&family=Anton&family=Space+Mono:wght@700&family=DM+Serif+Display&family=Archivo+Black&display=swap">
+<style>
+  :root{
+    --ground:#14171A; --panel:#1D2226; --panel-2:#232A2F; --line:#2A3136; --line-2:#354049;
+    --text:#E6EAED; --muted:#8A949C; --faint:#5C6870; --accent:#57C985; --accent-ink:#0B1F14;
+    --mono:'JetBrains Mono',ui-monospace,SFMono-Regular,Menlo,monospace;
+    --ui:'Inter',system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{color-scheme:dark}
+  body{margin:0;background:var(--ground);color:var(--text);font:14px/1.45 var(--ui);-webkit-font-smoothing:antialiased;overflow-x:hidden}
+  button,select,input{font:inherit;color:inherit}
+  .top{display:flex;align-items:center;gap:16px;padding:12px 18px;border-bottom:1px solid var(--line);background:var(--panel)}
+  .brand{display:flex;align-items:center;gap:9px;font-weight:600}
+  .brand i{width:14px;height:14px;border-radius:3px;background:var(--accent);display:inline-block}
+  .top .sub{color:var(--muted)}
+  .gpu{margin-left:auto;display:flex;gap:18px;font-family:var(--mono);font-size:12px;color:var(--muted)}
+  .gpu b{color:var(--text);font-weight:500}
+  .gpu .ok{color:var(--accent)}
+  .app{display:grid;grid-template-columns:236px 1fr 300px;min-height:calc(100vh - 49px)}
+  .col{border-right:1px solid var(--line);background:var(--panel)}
+  .col:last-child{border-right:0;border-left:1px solid var(--line)}
+  .h{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:14px 16px 8px;display:flex;align-items:center}
+  .h .add{margin-left:auto;display:flex;gap:4px}
+  .mini{background:transparent;border:1px solid var(--line-2);border-radius:5px;padding:3px 8px;font-size:11px;color:var(--muted);cursor:pointer;letter-spacing:0;text-transform:none}
+  .mini:hover{color:var(--text);border-color:var(--accent)}
+  .layers{display:flex;flex-direction:column}
+  .layer{display:flex;align-items:center;gap:10px;padding:9px 12px 9px 14px;border-left:2px solid transparent;cursor:pointer;user-select:none}
+  .layer:hover{background:var(--panel-2)}
+  .layer.sel{background:var(--panel-2);border-left-color:var(--accent)}
+  .layer .eye{width:26px;height:22px;border:1px solid var(--line-2);border-radius:5px;background:transparent;display:grid;place-items:center;cursor:pointer;color:var(--muted);font-size:11px}
+  .layer .eye.on{color:var(--accent);border-color:var(--accent)}
+  .layer .name{flex:1;font-weight:500;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .layer .tag{font-family:var(--mono);font-size:11px;color:var(--faint)}
+  .layer.gpu-layer .tag{color:var(--accent)}
+  .note{margin:12px 16px;padding:12px;border:1px solid var(--line);border-radius:6px;color:var(--muted);font-size:12.5px;line-height:1.5}
+  .note b{color:var(--text);font-weight:500}
+  .note code{font-family:var(--mono);font-size:11.5px}
+  .stage{display:flex;flex-direction:column;background:var(--ground);min-width:0}
+  .canvas-wrap{flex:1;display:grid;place-items:center;padding:22px;min-height:0}
+  canvas#out{max-width:100%;max-height:calc(100vh - 230px);border:1px solid var(--line);touch-action:none;cursor:default;background:
+    linear-gradient(45deg,#1b2024 25%,transparent 25%),linear-gradient(-45deg,#1b2024 25%,transparent 25%),
+    linear-gradient(45deg,transparent 75%,#1b2024 75%),linear-gradient(-45deg,transparent 75%,#1b2024 75%);
+    background-size:18px 18px;background-position:0 0,0 9px,9px -9px,-9px 0;background-color:#22282d}
+  canvas#out.grab{cursor:grab} canvas#out.grabbing{cursor:grabbing} canvas#out.rot{cursor:crosshair} canvas#out.scale{cursor:nwse-resize}
+  .strip{border-top:1px solid var(--line);padding:12px 18px;display:flex;align-items:center;gap:12px;background:var(--panel);flex-wrap:wrap}
+  .strip .lbl{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);margin-right:2px}
+  .thumb{width:58px;height:44px;border:1px solid var(--line-2);border-radius:5px;background:#fff center/contain no-repeat;cursor:pointer;position:relative;margin-bottom:14px}
+  .thumb:hover{border-color:var(--accent)}
+  .thumb span{position:absolute;left:0;right:0;bottom:-17px;font-size:10.5px;color:var(--muted);text-align:center}
+  .tpl{background:transparent;border:1px solid var(--line-2);border-radius:5px;padding:7px 12px;cursor:pointer;color:var(--text);font-size:12.5px;margin-bottom:14px}
+  .tpl:hover{border-color:var(--accent)}
+  .strip .sep{width:1px;height:34px;background:var(--line);margin:0 4px 14px}
+  .strip .hint{margin-left:auto;color:var(--muted);font-size:12px;max-width:380px;text-align:right;margin-bottom:14px}
+  .strip .hint b{color:var(--text);font-weight:500}
+  .props{padding:6px 0 18px}
+  .field{display:grid;grid-template-columns:92px 1fr;align-items:center;gap:10px;padding:6px 16px}
+  .field label{color:var(--muted);font-size:12.5px}
+  .field .v{display:flex;align-items:center;gap:8px}
+  input[type=range]{width:100%;accent-color:var(--accent)}
+  .num{font-family:var(--mono);font-size:11.5px;color:var(--muted);min-width:36px;text-align:right}
+  select{width:100%;background:var(--ground);border:1px solid var(--line-2);border-radius:5px;padding:6px 8px}
+  input[type=color]{width:34px;height:26px;border:1px solid var(--line-2);border-radius:5px;background:var(--ground);padding:2px}
+  input[type=text]{width:100%;background:var(--ground);border:1px solid var(--line-2);border-radius:5px;padding:6px 8px}
+  .seg{display:flex;border:1px solid var(--line-2);border-radius:5px;overflow:hidden;width:100%}
+  .seg button{flex:1;background:transparent;border:0;padding:6px 4px;cursor:pointer;color:var(--muted);font-size:12px}
+  .seg button.on{background:var(--accent);color:var(--accent-ink);font-weight:600}
+  .seg button:hover:not(.on){color:var(--text)}
+  .ptitle{padding:14px 16px 4px;font-weight:600}
+  .ptitle small{display:block;color:var(--muted);font-weight:400;font-size:12.5px;margin-top:2px}
+  .kicker{padding:0 16px 8px;font-family:var(--mono);font-size:11.5px;color:var(--accent)}
+  .sub-h{font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);padding:12px 16px 2px;display:flex;align-items:center;gap:10px}
+  .sub-h .sw{margin-left:auto;display:flex;gap:5px}
+  .row-btns{display:flex;gap:6px;padding:8px 16px}
+  .row-btns button{flex:1;background:transparent;border:1px solid var(--line-2);border-radius:5px;padding:6px;cursor:pointer;color:var(--text);font-size:12px}
+  .row-btns button:hover{border-color:var(--accent)}
+  .row-btns button.danger:hover{border-color:#d9534f;color:#f0a09d}
+  .tip{padding:10px 16px 0;color:var(--faint);font-size:12px}
+  @media (max-width:980px){
+    .app{grid-template-columns:1fr}
+    .col{border-right:0;border-bottom:1px solid var(--line)}
+    canvas#out{max-height:62vh}
+    .strip .hint{display:none}
+  }
+</style>
+
+<div class="top">
+  <div class="brand"><i></i>Knockout Layers</div>
+  <div class="sub">Drag anything on the canvas. Rotate from the top handle, resize from the corner.</div>
+  <div class="gpu">
+    <span>GPU calls <b id="gpuCount">4</b> <span class="ok">(one per cutout, already done)</span></span>
+    <span>last render <b id="ms">0</b> ms</span>
+  </div>
+</div>
+
+<div class="app">
+  <div class="col">
+    <div class="h">Layers <span class="add"><button class="mini" id="addText">+ text</button></span></div>
+    <div class="layers" id="layers"></div>
+    <div class="note"><b>The only paid step is the cutout.</b> Move, rotate, flip, scale, shadow, outline, every effect, every font: canvas math on the viewer's machine. No request leaves the page.</div>
+    <div class="note"><b>Nothing here touches the API.</b> Same <code>/remove</code>, <code>/studio-shot</code>, <code>engine=auto</code>. A web app layer, built after the response.</div>
+  </div>
+
+  <div class="stage">
+    <div class="canvas-wrap"><canvas id="out"></canvas></div>
+    <div class="strip">
+      <span class="lbl">Add product</span>
+      <div class="thumb" data-p="shoe"><span>shoe</span></div>
+      <div class="thumb" data-p="bike"><span>bike</span></div>
+      <div class="thumb" data-p="chain"><span>chain</span></div>
+      <div class="thumb" data-p="dog"><span>dog</span></div>
+      <div class="sep"></div>
+      <span class="lbl">Templates</span>
+      <button class="tpl" data-t="hero">Hero</button>
+      <button class="tpl" data-t="collage">Collage</button>
+      <button class="tpl" data-t="poster">Poster</button>
+      <div class="hint"><b>Collage is just more than one subject on the stack.</b> Each cutout was one GPU call; arranging them costs nothing. Templates set the whole look at once.</div>
+    </div>
+  </div>
+
+  <div class="col"><div id="props"></div></div>
+</div>
+
+<script>
+const IMG = {
+  shoe:  { bg:"{{SHOE_BG}}",  cut:"{{SHOE_CUT}}" },
+  bike:  { bg:"{{BIKE_BG}}",  cut:"{{BIKE_CUT}}" },
+  chain: { bg:"{{CHAIN_BG}}", cut:"{{CHAIN_CUT}}" },
+  dog:   { bg:"{{DOG_BG}}",   cut:"{{DOG_CUT}}" },
+};
+const W=1000, H=700;
+const FX=['none','halftone','dither','pixel','lego','ascii','duotone','silhouette'];
+const FONTS=['Inter','Bebas Neue','Anton','Archivo Black','Playfair Display','DM Serif Display','Space Mono','JetBrains Mono'];
+let uid=1;
+
+// ---------------- state ----------------
+const state={ sel:null, layers:[], background:{ mode:'photo', photo:'shoe', fx:'halftone', amount:7, color:'#111417', colorA:'#0f1a14', colorB:'#57C985' } };
+function subjectLayer(p, o={}){ return Object.assign({ id:uid++, type:'subject', product:p, on:true, x:W/2, y:H/2, scale:0.9, rot:0, flipX:false, flipY:false,
+  fx:'none', amount:6, colorA:'#1c1f22', colorB:'#57C985', shadow:true, sdx:18, sdy:26, sblur:28, sop:0.5, outline:false, owidth:8, ocolor:'#ffffff' }, o); }
+function textLayer(o={}){ return Object.assign({ id:uid++, type:'text', on:true, value:'NEW SEASON', font:'Bebas Neue', size:96, color:'#57C985', x:W/2, y:110, rot:0, scale:1, flipX:false }, o); }
+
+// ---------------- images ----------------
+const cache={};
+function load(src){ return new Promise(r=>{ const i=new Image(); i.onload=()=>r(i); i.src=src; }); }
+async function getImgs(p){ if(!cache[p]){ const bg=await load(IMG[p].bg), cut=await load(IMG[p].cut);
+  const a=mk(cut.width,cut.height); a.getContext('2d').drawImage(cut,0,0); cache[p]={bg,cut,alpha:a.getContext('2d').getImageData(0,0,cut.width,cut.height).data}; } return cache[p]; }
+
+// ---------------- effects ----------------
+function mk(w,h){ const c=document.createElement('canvas'); c.width=w; c.height=h; return c; }
+function lum(d,i){ return 0.2126*d[i]+0.7152*d[i+1]+0.0722*d[i+2]; }
+function hex(h){ h=h.replace('#',''); return [parseInt(h.slice(0,2),16),parseInt(h.slice(2,4),16),parseInt(h.slice(4,6),16)]; }
+function fxPixel(src,block,lego){ const w=src.width,h=src.height,out=mk(w,h),o=out.getContext('2d'),s=src.getContext('2d').getImageData(0,0,w,h).data;
+  for(let y=0;y<h;y+=block)for(let x=0;x<w;x+=block){ let r=0,g=0,b=0,n=0;
+    for(let yy=y;yy<Math.min(y+block,h);yy++)for(let xx=x;xx<Math.min(x+block,w);xx++){ const i=(yy*w+xx)*4; if(s[i+3]<8)continue; r+=s[i];g+=s[i+1];b+=s[i+2];n++; }
+    if(!n||n/(block*block)<0.35)continue; r/=n;g/=n;b/=n; o.fillStyle=`rgb(${r|0},${g|0},${b|0})`; o.fillRect(x,y,block,block);
+    if(lego){ o.fillStyle='rgba(255,255,255,.22)';o.beginPath();o.arc(x+block/2,y+block/2,block*.3,0,7);o.fill();
+      o.fillStyle='rgba(0,0,0,.18)';o.beginPath();o.arc(x+block/2+block*.08,y+block/2+block*.08,block*.3,0,7);o.fill();
+      o.fillStyle=`rgb(${r|0},${g|0},${b|0})`;o.beginPath();o.arc(x+block/2,y+block/2,block*.24,0,7);o.fill(); } }
+  return out; }
+function fxHalftone(src,cell,ink,paper){ const w=src.width,h=src.height,out=mk(w,h),o=out.getContext('2d'),s=src.getContext('2d').getImageData(0,0,w,h).data;
+  for(let y=0;y<h;y+=cell)for(let x=0;x<w;x+=cell){ let L=0,A=0,n=0;
+    for(let yy=y;yy<Math.min(y+cell,h);yy++)for(let xx=x;xx<Math.min(x+cell,w);xx++){ const i=(yy*w+xx)*4; L+=lum(s,i);A+=s[i+3];n++; }
+    L/=n;A/=n; if(A<40)continue; if(paper){o.fillStyle=paper;o.globalAlpha=A/255;o.fillRect(x,y,cell,cell);o.globalAlpha=1;}
+    o.fillStyle=ink;o.globalAlpha=A/255;o.beginPath();o.arc(x+cell/2,y+cell/2,(1-L/255)*cell*0.62,0,7);o.fill();o.globalAlpha=1; }
+  return out; }
+const BAYER=[[0,8,2,10],[12,4,14,6],[3,11,1,9],[15,7,13,5]];
+function fxDither(src,scale,ink,paper){ const w=src.width,h=src.height,out=mk(w,h),o=out.getContext('2d'),id=src.getContext('2d').getImageData(0,0,w,h),s=id.data,d=o.createImageData(w,h).data,I=hex(ink),P=hex(paper);
+  for(let y=0;y<h;y++)for(let x=0;x<w;x++){ const i=(y*w+x)*4,a=s[i+3]; if(a<8)continue; const t=(BAYER[(y/scale|0)%4][(x/scale|0)%4]+0.5)/16*255; const c=lum(s,i)<t?I:P; d[i]=c[0];d[i+1]=c[1];d[i+2]=c[2];d[i+3]=a; }
+  o.putImageData(new ImageData(d,w,h),0,0); return out; }
+function fxAscii(src,cell,ink){ const w=src.width,h=src.height,out=mk(w,h),o=out.getContext('2d'),s=src.getContext('2d').getImageData(0,0,w,h).data,ramp=' .:-=+*#%@';
+  o.font=`${cell*1.15}px JetBrains Mono, monospace`;o.textBaseline='top';
+  for(let y=0;y<h;y+=cell)for(let x=0;x<w;x+=cell){ let L=0,A=0,n=0;
+    for(let yy=y;yy<Math.min(y+cell,h);yy++)for(let xx=x;xx<Math.min(x+cell,w);xx++){ const i=(yy*w+xx)*4;L+=lum(s,i);A+=s[i+3];n++; }
+    L/=n;A/=n; if(A<40)continue; o.fillStyle=ink;o.globalAlpha=A/255;o.fillText(ramp[Math.min(9,Math.round((1-L/255)*9))],x,y);o.globalAlpha=1; }
+  return out; }
+function fxDuotone(src,a,b){ const w=src.width,h=src.height,out=mk(w,h),o=out.getContext('2d'),id=src.getContext('2d').getImageData(0,0,w,h),s=id.data,A=hex(a),B=hex(b);
+  for(let i=0;i<s.length;i+=4){ const t=lum(s,i)/255; s[i]=A[0]+(B[0]-A[0])*t;s[i+1]=A[1]+(B[1]-A[1])*t;s[i+2]=A[2]+(B[2]-A[2])*t; } o.putImageData(id,0,0); return out; }
+function fxSilhouette(src,color){ const out=mk(src.width,src.height),o=out.getContext('2d'); o.drawImage(src,0,0);o.globalCompositeOperation='source-in';o.fillStyle=color;o.fillRect(0,0,out.width,out.height); return out; }
+function applyFx(src,L){ const amt=L.amount|0; switch(L.fx){
+  case 'halftone':return fxHalftone(src,Math.max(3,amt),L.colorA,L.colorB);
+  case 'dither':return fxDither(src,Math.max(1,Math.round(amt/3)),L.colorA,L.colorB);
+  case 'pixel':return fxPixel(src,Math.max(3,amt*1.6|0),false);
+  case 'lego':return fxPixel(src,Math.max(6,amt*2.2|0),true);
+  case 'ascii':return fxAscii(src,Math.max(5,amt*1.4|0),L.colorB);
+  case 'duotone':return fxDuotone(src,L.colorA,L.colorB);
+  case 'silhouette':return fxSilhouette(src,L.colorA);
+  default:return src; } }
+// cache: effects are recomputed only when their inputs change, so dragging stays smooth
+const fxCache=new Map();
+function cachedFx(key,make){ if(!fxCache.has(key)){ if(fxCache.size>40) fxCache.clear(); fxCache.set(key,make()); } return fxCache.get(key); }
+
+// ---------------- geometry ----------------
+function subjectBox(L){ const c=cache[L.product].cut; return { w:c.width*L.scale, h:c.height*L.scale }; }
+function textBox(L){ const c=mctx; c.font=`700 ${L.size}px "${L.font}", Inter, sans-serif`; const m=c.measureText(L.value||' '); return { w:(m.width+L.size*0.2)*L.scale, h:L.size*1.05*L.scale }; }
+function boxOf(L){ return L.type==='subject'?subjectBox(L):textBox(L); }
+function toLocal(L,px,py){ const dx=px-L.x, dy=py-L.y, c=Math.cos(-L.rot), s=Math.sin(-L.rot); return { x:dx*c-dy*s, y:dx*s+dy*c }; }
+function hit(L,px,py){ const {w,h}=boxOf(L), p=toLocal(L,px,py); if(Math.abs(p.x)>w/2||Math.abs(p.y)>h/2) return false;
+  if(L.type==='text') return true;
+  const c=cache[L.product]; let u=(p.x/w+0.5), v=(p.y/h+0.5); if(L.flipX)u=1-u; if(L.flipY)v=1-v;
+  const ix=Math.min(c.cut.width-1,Math.max(0,u*c.cut.width|0)), iy=Math.min(c.cut.height-1,Math.max(0,v*c.cut.height|0));
+  return c.alpha[(iy*c.cut.width+ix)*4+3]>20; }        // pixel-accurate: you grab the shoe, not a box around it
+function handles(L){ const {w,h}=boxOf(L), c=Math.cos(L.rot), s=Math.sin(L.rot);
+  const rot=(x,y)=>({x:L.x+x*c-y*s, y:L.y+x*s+y*c});
+  return { rotate:rot(0,-h/2-34), scale:rot(w/2,h/2), corners:[rot(-w/2,-h/2),rot(w/2,-h/2),rot(w/2,h/2),rot(-w/2,h/2)] }; }
+
+// ---------------- render ----------------
+const out=document.getElementById('out'), ctx=out.getContext('2d'); out.width=W; out.height=H;
+const mctx=mk(10,10).getContext('2d');
+let raf=null; function render(){ if(raf)return; raf=requestAnimationFrame(async()=>{raf=null;await draw();}); }
+async function draw(){
+  const t0=performance.now(); const B=state.background; await getImgs(B.photo);
+  ctx.setTransform(1,0,0,1,0,0); ctx.clearRect(0,0,W,H);
+  // background
+  let bg=mk(W,H), bc=bg.getContext('2d');
+  if(B.mode==='photo'){ const im=cache[B.photo].bg, s=Math.max(W/im.width,H/im.height); bc.drawImage(im,(W-im.width*s)/2,(H-im.height*s)/2,im.width*s,im.height*s);
+    bg=cachedFx('bg|'+JSON.stringify(B), ()=>applyFx(bg,B)); }
+  else if(B.mode==='color'){ bc.fillStyle=B.color; bc.fillRect(0,0,W,H); }
+  else { const g=bc.createLinearGradient(0,0,W,H); g.addColorStop(0,B.colorA); g.addColorStop(1,B.colorB); bc.fillStyle=g; bc.fillRect(0,0,W,H); }
+  ctx.drawImage(bg,0,0);
+  // layers, bottom to top
+  for(const L of [...state.layers].reverse()){ if(!L.on)continue; await getImgs(L.product||'shoe');
+    ctx.save(); ctx.translate(L.x,L.y); ctx.rotate(L.rot); ctx.scale((L.flipX?-1:1)*L.scale,(L.flipY?-1:1)*L.scale);
+    if(L.type==='subject'){ const c=cache[L.product].cut, w=c.width, h=c.height;
+      const base=cachedFx('cut|'+L.product, ()=>{ const k=mk(w,h); k.getContext('2d').drawImage(c,0,0); return k; });
+      if(L.shadow){ ctx.save(); ctx.globalAlpha=L.sop; ctx.filter=`blur(${L.sblur/2}px)`; ctx.drawImage(cachedFx('sil|'+L.product, ()=>fxSilhouette(base,'#000')), -w/2+L.sdx/L.scale, -h/2+L.sdy/L.scale); ctx.restore(); }
+      if(L.outline&&L.owidth>0){ const sil=cachedFx('sil|'+L.product+'|'+L.ocolor, ()=>fxSilhouette(base,L.ocolor)), r=L.owidth/L.scale;
+        for(let k=0;k<24;k++){ const a=k/24*Math.PI*2; ctx.drawImage(sil,-w/2+Math.cos(a)*r,-h/2+Math.sin(a)*r); } }
+      ctx.drawImage(cachedFx('fx|'+L.product+'|'+L.fx+'|'+L.amount+'|'+L.colorA+'|'+L.colorB, ()=>applyFx(base,L)), -w/2,-h/2);
+    } else { ctx.font=`700 ${L.size}px "${L.font}", Inter, sans-serif`; ctx.fillStyle=L.color; ctx.textAlign='center'; ctx.textBaseline='middle'; ctx.fillText(L.value,0,0); }
+    ctx.restore(); }
+  // selection chrome
+  const S=state.layers.find(l=>l.id===state.sel);
+  if(S&&S.on){ const hd=handles(S); ctx.save(); ctx.strokeStyle='#57C985'; ctx.lineWidth=1.5; ctx.setLineDash([6,4]);
+    ctx.beginPath(); hd.corners.forEach((p,i)=>i?ctx.lineTo(p.x,p.y):ctx.moveTo(p.x,p.y)); ctx.closePath(); ctx.stroke(); ctx.setLineDash([]);
+    const top={x:(hd.corners[0].x+hd.corners[1].x)/2,y:(hd.corners[0].y+hd.corners[1].y)/2}; ctx.beginPath(); ctx.moveTo(top.x,top.y); ctx.lineTo(hd.rotate.x,hd.rotate.y); ctx.stroke();
+    ctx.fillStyle='#57C985'; ctx.beginPath(); ctx.arc(hd.rotate.x,hd.rotate.y,7,0,7); ctx.fill();
+    ctx.fillStyle='#14171A'; ctx.strokeStyle='#57C985'; ctx.lineWidth=2; ctx.fillRect(hd.scale.x-7,hd.scale.y-7,14,14); ctx.strokeRect(hd.scale.x-7,hd.scale.y-7,14,14); ctx.restore(); }
+  document.getElementById('ms').textContent=Math.max(1,Math.round(performance.now()-t0));
+}
+
+// ---------------- pointer interaction ----------------
+let drag=null;
+function canvasPt(e){ const r=out.getBoundingClientRect(); return { x:(e.clientX-r.left)*W/r.width, y:(e.clientY-r.top)*H/r.height }; }
+const near=(a,b,d=14)=>Math.hypot(a.x-b.x,a.y-b.y)<d;
+out.addEventListener('pointerdown',e=>{ const p=canvasPt(e); const S=state.layers.find(l=>l.id===state.sel);
+  if(S&&S.on){ const hd=handles(S);
+    if(near(p,hd.rotate)){ drag={mode:'rot',L:S,start:Math.atan2(p.y-S.y,p.x-S.x)-S.rot}; out.setPointerCapture(e.pointerId); return; }
+    if(near(p,hd.scale)){ drag={mode:'scale',L:S,d0:Math.hypot(p.x-S.x,p.y-S.y),s0:S.scale}; out.setPointerCapture(e.pointerId); return; } }
+  for(const L of state.layers){ if(L.on&&hit(L,p.x,p.y)){ state.sel=L.id; drag={mode:'move',L,ox:p.x-L.x,oy:p.y-L.y}; out.classList.add('grabbing'); out.setPointerCapture(e.pointerId); renderLayers(); renderProps(); render(); return; } }
+  state.sel=null; renderLayers(); renderProps(); render(); });
+out.addEventListener('pointermove',e=>{ const p=canvasPt(e);
+  if(drag){ const L=drag.L;
+    if(drag.mode==='move'){ L.x=p.x-drag.ox; L.y=p.y-drag.oy; }
+    else if(drag.mode==='rot'){ L.rot=Math.atan2(p.y-L.y,p.x-L.x)-drag.start; if(e.shiftKey) L.rot=Math.round(L.rot/(Math.PI/12))*(Math.PI/12); }
+    else { L.scale=Math.max(0.08,drag.s0*Math.hypot(p.x-L.x,p.y-L.y)/drag.d0); }
+    syncProps(L); render(); return; }
+  const S=state.layers.find(l=>l.id===state.sel); out.className='';
+  if(S&&S.on){ const hd=handles(S); if(near(p,hd.rotate)){out.classList.add('rot');return;} if(near(p,hd.scale)){out.classList.add('scale');return;} }
+  if(state.layers.some(L=>L.on&&hit(L,p.x,p.y))) out.classList.add('grab'); });
+out.addEventListener('pointerup',()=>{ drag=null; out.classList.remove('grabbing'); });
+window.addEventListener('keydown',e=>{ const S=state.layers.find(l=>l.id===state.sel); if(!S||e.target.tagName==='INPUT')return;
+  const step=e.shiftKey?10:1; if(e.key==='ArrowLeft')S.x-=step; if(e.key==='ArrowRight')S.x+=step; if(e.key==='ArrowUp')S.y-=step; if(e.key==='ArrowDown')S.y+=step;
+  if(e.key==='Delete'||e.key==='Backspace'){ removeLayer(S.id); return; } render(); });
+
+// ---------------- layer list ----------------
+function renderLayers(){ const el=document.getElementById('layers'); el.innerHTML='';
+  const rows=[...state.layers.map(L=>({L,key:L.id})),{L:null,key:'bg'}];
+  for(const {L,key} of rows){ const isBg=!L; const on=isBg?true:L.on; const selected=isBg?state.sel==='bg':state.sel===L.id;
+    const row=document.createElement('div'); row.className='layer'+(selected?' sel':'')+(!isBg&&L.type==='subject'?' gpu-layer':'');
+    const name=isBg?'Background':(L.type==='text'?`Text: ${L.value.slice(0,14)}`:`Subject: ${L.product}`);
+    const tag=isBg?'canvas':(L.type==='subject'?'1 GPU call':'canvas');
+    row.innerHTML=`<button class="eye ${on?'on':''}" ${isBg?'disabled':''}>${on?'●':'○'}</button><span class="name">${name}</span><span class="tag">${tag}</span>`;
+    if(!isBg) row.querySelector('.eye').onclick=e=>{e.stopPropagation();L.on=!L.on;renderLayers();render();};
+    row.onclick=()=>{state.sel=isBg?'bg':L.id;renderLayers();renderProps();render();}; el.appendChild(row); } }
+
+// ---------------- properties ----------------
+const field=(l,inner)=>`<div class="field"><label>${l}</label><div class="v">${inner}</div></div>`;
+const range=(id,min,max,val,step=1)=>`<input type="range" id="${id}" min="${min}" max="${max}" step="${step}" value="${val}"><span class="num" id="${id}_n">${fmt(val)}</span>`;
+const fmt=v=>typeof v==='number'?(Number.isInteger(v)?v:v.toFixed(2)):v;
+const sel=(id,opts,val)=>`<select id="${id}">${opts.map(o=>`<option ${o===val?'selected':''}>${o}</option>`).join('')}</select>`;
+const color=(id,val)=>`<input type="color" id="${id}" value="${val}">`;
+const seg=(id,opts,val)=>`<div class="seg" id="${id}">${opts.map(o=>`<button data-v="${o}" class="${String(o)===String(val)?'on':''}">${o}</button>`).join('')}</div>`;
+function renderProps(){ const el=document.getElementById('props'); let h='';
+  if(state.sel==='bg'){ const B=state.background;
+    h+=`<div class="ptitle">Background<small>Effects here stop at the subject's edge. That is the mask doing the work.</small></div><div class="kicker">0 GPU calls</div><div class="props">`;
+    h+=field('Fill',seg('mode',['photo','color','gradient'],B.mode));
+    if(B.mode==='photo'){ h+=field('Photo',sel('photo',Object.keys(IMG),B.photo)); h+=field('Effect',sel('fx',FX.filter(f=>f!=='silhouette'),B.fx)); h+=field('Amount',range('amount',2,16,B.amount)); h+=field('Ink',color('colorA',B.colorA)); h+=field('Paper / tint',color('colorB',B.colorB)); }
+    if(B.mode==='color') h+=field('Color',color('color',B.color));
+    if(B.mode==='gradient'){ h+=field('From',color('colorA',B.colorA)); h+=field('To',color('colorB',B.colorB)); }
+    h+='</div>'; el.innerHTML=h; bind(el,B); return; }
+  const L=state.layers.find(l=>l.id===state.sel);
+  if(!L){ el.innerHTML=`<div class="ptitle">Nothing selected<small>Click a layer on the left, or click something on the canvas.</small></div>
+    <div class="tip">Drag to move. Green dot rotates (hold Shift to snap 15°). Corner square resizes. Arrow keys nudge. Delete removes.</div>`; return; }
+  if(L.type==='subject'){
+    h+=`<div class="ptitle">Subject: ${L.product}<small>The cutout from /remove. The only layer that ever cost a GPU call.</small></div><div class="kicker">1 GPU call, done</div><div class="props">`;
+    h+=`<div class="sub-h">Transform</div>`;
+    h+=field('Scale',range('scale',0.1,2.5,L.scale,0.01)); h+=field('Rotate',range('rot',-3.1416,3.1416,L.rot,0.01));
+    h+=`<div class="row-btns"><button data-act="flipX">Flip ↔</button><button data-act="flipY">Flip ↕</button><button data-act="dup">Duplicate</button><button data-act="del" class="danger">Remove</button></div>`;
+    h+=`<div class="sub-h">Effect</div>`;
+    h+=field('Effect',sel('fx',FX,L.fx)); h+=field('Amount',range('amount',2,16,L.amount)); h+=field('Ink',color('colorA',L.colorA)); h+=field('Paper / tint',color('colorB',L.colorB));
+    h+=`<div class="sub-h">Shadow <span class="sw">${seg('shadow',['off','on'],L.shadow?'on':'off')}</span></div>`;
+    if(L.shadow){ h+=field('Offset X',range('sdx',-80,80,L.sdx)); h+=field('Offset Y',range('sdy',-80,80,L.sdy)); h+=field('Blur',range('sblur',0,80,L.sblur)); h+=field('Opacity',range('sop',0,1,L.sop,0.05)); }
+    h+=`<div class="sub-h">Outline <span class="sw">${seg('outline',['off','on'],L.outline?'on':'off')}</span></div>`;
+    if(L.outline){ h+=field('Width',range('owidth',1,30,L.owidth)); h+=field('Color',color('ocolor',L.ocolor)); }
+    h+=`<div class="tip">Shadow and outline are paid server calls in the API today. Here they are free.</div></div>`;
+  } else {
+    h+=`<div class="ptitle">Text<small>Drag it, rotate it, pick any font. Baked into the export.</small></div><div class="kicker">0 GPU calls</div><div class="props">`;
+    h+=field('Text',`<input type="text" id="value" value="${L.value.replace(/"/g,'&quot;')}">`);
+    h+=field('Font',sel('font',FONTS,L.font)); h+=field('Size',range('size',18,220,L.size)); h+=field('Color',color('color',L.color));
+    h+=field('Rotate',range('rot',-3.1416,3.1416,L.rot,0.01)); h+=field('Scale',range('scale',0.2,3,L.scale,0.01));
+    h+=`<div class="row-btns"><button data-act="flipX">Mirror</button><button data-act="dup">Duplicate</button><button data-act="del" class="danger">Remove</button></div></div>`;
+  }
+  el.innerHTML=h; bind(el,L);
+  el.querySelectorAll('[data-act]').forEach(b=>b.onclick=()=>{ const a=b.dataset.act;
+    if(a==='flipX')L.flipX=!L.flipX; if(a==='flipY')L.flipY=!L.flipY;
+    if(a==='dup'){ const c=Object.assign({},L,{id:uid++,x:L.x+40,y:L.y+40}); state.layers.unshift(c); state.sel=c.id; renderLayers(); renderProps(); }
+    if(a==='del'){ removeLayer(L.id); return; } render(); });
+}
+function bind(el,T){ el.querySelectorAll('input,select').forEach(inp=>{ inp.oninput=()=>{ const v=inp.type==='range'?parseFloat(inp.value):inp.value; T[inp.id]=v; const n=document.getElementById(inp.id+'_n'); if(n)n.textContent=fmt(v); if(inp.id==='photo'){getImgs(v).then(render);} if(inp.id==='font'){document.fonts.load(`700 40px "${v}"`).then(render);} render(); if(inp.id==='value')renderLayers(); }; inp.onchange=inp.oninput; });
+  el.querySelectorAll('.seg').forEach(sg=>sg.querySelectorAll('button').forEach(b=>b.onclick=()=>{ const v=b.dataset.v; T[sg.id]=(v==='on')?true:(v==='off')?false:v; renderProps(); render(); })); }
+function syncProps(L){ for(const k of ['scale','rot','x','y']){ const i=document.getElementById(k); if(i&&i.type==='range'){ i.value=L[k]; const n=document.getElementById(k+'_n'); if(n)n.textContent=fmt(L[k]); } } }
+function removeLayer(id){ state.layers=state.layers.filter(l=>l.id!==id); state.sel=null; renderLayers(); renderProps(); render(); }
+
+// ---------------- strip: add products, templates ----------------
+async function addProduct(p,o={}){ await getImgs(p); const c=cache[p].cut; const fit=Math.min(1, 380/Math.max(c.width,c.height));
+  const L=subjectLayer(p,Object.assign({scale:fit},o)); state.layers.unshift(L); state.sel=L.id; document.getElementById('gpuCount').textContent=String(new Set(state.layers.filter(l=>l.type==='subject').map(l=>l.product)).size||1); renderLayers(); renderProps(); render(); return L; }
+document.querySelectorAll('.thumb').forEach(t=>{ t.style.backgroundImage=`url(${IMG[t.dataset.p].cut})`; t.onclick=()=>addProduct(t.dataset.p,{x:W/2+(Math.random()*160-80),y:H/2+(Math.random()*100-50)}); });
+document.getElementById('addText').onclick=()=>{ const L=textLayer({value:'YOUR TEXT',y:H-90,size:64}); state.layers.unshift(L); state.sel=L.id; renderLayers(); renderProps(); render(); };
+const TEMPLATES={
+  hero: async()=>{ state.layers=[]; Object.assign(state.background,{mode:'photo',photo:'shoe',fx:'halftone',amount:7,colorA:'#0f1a14',colorB:'#57C985'});
+    await addProduct('shoe',{x:W*0.62,y:H*0.55,scale:1.05,rot:-0.12,shadow:true,sdx:22,sdy:30,sblur:30});
+    state.layers.unshift(textLayer({value:'NEW SEASON',font:'Bebas Neue',size:132,color:'#E6EAED',x:W*0.27,y:H*0.32,rot:-0.06}));
+    state.layers.unshift(textLayer({value:'DROP 04',font:'Space Mono',size:30,color:'#57C985',x:W*0.27,y:H*0.46,rot:-0.06})); },
+  collage: async()=>{ state.layers=[]; Object.assign(state.background,{mode:'gradient',colorA:'#101418',colorB:'#1f2a24'});
+    await addProduct('shoe',{x:W*0.30,y:H*0.42,scale:0.78,rot:0.18,shadow:true,sdx:14,sdy:22,sblur:26,sop:0.55});
+    await addProduct('chain',{x:W*0.58,y:H*0.52,scale:0.46,rot:-0.1,shadow:true,sdx:10,sdy:16,sblur:20,sop:0.5});
+    await addProduct('bike',{x:W*0.74,y:H*0.34,scale:0.56,rot:-0.22,shadow:true,sdx:12,sdy:20,sblur:24,sop:0.5});
+    await addProduct('dog',{x:W*0.80,y:H*0.72,scale:0.42,rot:0.08,shadow:true,sdx:10,sdy:14,sblur:20,sop:0.45});
+    state.layers.unshift(textLayer({value:'THE EDIT',font:'Playfair Display',size:110,color:'#E6EAED',x:W*0.31,y:H*0.80,rot:0}));
+    state.layers.unshift(textLayer({value:'four products, four cutouts, zero extra calls',font:'Inter',size:22,color:'#8A949C',x:W*0.31,y:H*0.90,rot:0})); },
+  poster: async()=>{ state.layers=[]; Object.assign(state.background,{mode:'color',color:'#F1EDE4'});
+    await addProduct('bike',{x:W*0.5,y:H*0.5,scale:1.35,rot:0,fx:'silhouette',colorA:'#111417',shadow:false,outline:false});
+    await addProduct('bike',{x:W*0.5,y:H*0.5,scale:1.35,rot:0,fx:'dither',amount:6,colorA:'#111417',colorB:'#F1EDE4',shadow:false,outline:true,owidth:3,ocolor:'#111417'});
+    state.layers.unshift(textLayer({value:'RIDE',font:'Anton',size:220,color:'#111417',x:W*0.22,y:H*0.24,rot:-1.5708}));
+    state.layers.unshift(textLayer({value:'EST. 2030 · FIXED GEAR',font:'Space Mono',size:22,color:'#111417',x:W*0.78,y:H*0.90,rot:0})); },
+};
+document.querySelectorAll('.tpl').forEach(b=>b.onclick=async()=>{ await TEMPLATES[b.dataset.t](); state.sel=null; renderLayers(); renderProps(); render(); });
+
+// ---------------- boot ----------------
+(async()=>{ await Promise.all(Object.keys(IMG).map(getImgs)); await document.fonts.ready; await TEMPLATES.hero(); state.sel=null; renderLayers(); renderProps(); render(); })();
+</script>
