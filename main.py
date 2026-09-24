@@ -141,7 +141,22 @@ class GuestQuotaExceeded(Exception):
 # default-engine mask, which is where the halo win came from in the first place.
 # 900 == the refiner's own tile size. Anything larger tiles and can seam; 1600
 # was tried first and still left 7.9% of the box interior semi-transparent.
+#
+# 2026-09-24: the 900 cap made FILM EDGES worse. Refining at 900 and stretching
+# the alpha 3.4x back to 3072x4080 serrated the edge (tan, salmon) and let the
+# white rim back in; Troy compared crops against the Aug 23 native-res output
+# and the native one was clearly cleaner. The cap is now a FALLBACK only: refine
+# at native first, pin the interior (see PRODUCT_REFINE_EDGE_BAND), and drop to
+# the cap only if the interior guard still reports damage.
 PRODUCT_REFINE_MAX_DIM = int(os.environ.get("PRODUCT_REFINE_MAX_DIM", "") or 900)
+# The refiner's job is the EDGE (the lightbox halo was 10-40px at 3072). Tile
+# seams are an INTERIOR failure: at native res the fused alpha comes back with
+# faint washes (1-5% transparent over 3-6% of a film's interior, visible as a
+# lighter square on the light-pink sheet) and, on large flat boxes, real holes.
+# So after refining, every pixel deeper than this fraction of the long side
+# inside the S3OD mask is restored to the S3OD value. ~61px at 4080. The
+# refiner keeps full control of the edge band and cannot touch the middle.
+PRODUCT_REFINE_EDGE_BAND = 0.015
 # Refinement may legitimately shrink a boundary; it must never punch a hole
 # through the middle of the subject. Measured away from the edge, so ordinary
 # boundary tightening cannot trip it.
@@ -151,6 +166,63 @@ PRODUCT_REFINE_MAX_INTERIOR_LOSS = 0.01
 # keep the default when escalation backfires. Shape routing cannot see damage;
 # this can. 1% of the subject interior going transparent is the limit.
 AUTO_MAX_PRODUCT_REGRESSION = 0.01
+
+# ---- engine=backdrop (flat-colour key, zero GPU) ----------------------------
+# Added 2026-09-19 for Tomek's memorial plaque (eval/cases/cross-plaque): a
+# large matte-black plate with a cross-shaped CUTOUT on white. Salient-object
+# models keep the bright cross (which is backdrop showing through a hole) and
+# drop the plate. Every engine we had did this identically. A backdrop key
+# inverts the question: anything that is not the backdrop colour is subject,
+# so holes come out transparent for free.
+# KNOWN LIMIT (measured 2026-09-20, eval/cases/flower-pale-leaves): cast
+# shadows are not the backdrop colour, so a colour key keeps them as solid
+# subject. On soft-lit organics the standard engine is strictly better. This
+# engine is for hard-edged, flat-lit products with real holes. Never a
+# default. engine=auto reaches it only through the narrow rescue gate below.
+# Ramp: pixels within LO of the backdrop colour are fully transparent, beyond
+# HI fully opaque, linear between. 12/40 tuned on the plaque's matte black
+# edge against pure white.
+BACKDROP_KEY_LO = 12.0
+BACKDROP_KEY_HI = 40.0
+# Specular highlights on chrome/gold read as backdrop and punch tiny holes in
+# the subject. Real holes (the cross) are large; specular flecks are not. Any
+# enclosed transparent island under this fraction of the frame is refilled.
+# 0.2% cleared 456 flecks on the plaque and left the cross open.
+BACKDROP_HOLE_MAX_FRAC = 0.002
+# Size alone cannot tell a real hole from light-coloured CONTENT: the gold
+# candle box's white tissue (1.18% of frame) keyed out as a hole, while the
+# plaque's cross (1.71%) must stay open. Colour can: a real hole shows the
+# backdrop itself, so its pixels sit ON the backdrop colour. Measured mean
+# distance: cross 0.5, fretwork 0.8, gold-box tissue 15.5, other gold-box
+# islands 7.0-12.9. An enclosed island is left open only if it is BOTH large
+# and within this distance; otherwise it is refilled as subject.
+BACKDROP_HOLE_MAX_DIST = 3.0
+# The key is only meaningful on a flat backdrop. Measured as the share of
+# frame-border pixels within KEY_LO of the border's median colour. NOT a
+# uniformity test: product shots routinely have the subject bleeding off an
+# edge (the plaque's book leaves the frame on the left and it still keys
+# cleanly at 67%). Measured on eval/cases/: plaque 67%, grass 35%, dark studio
+# 22%, grey film 12%, skyline 2%. 50% sits in the gap. Below it the request is
+# refused rather than silently keying garbage.
+BACKDROP_MIN_BORDER_FRAC = 0.50
+
+# ---- engine=auto backdrop rescue (2026-09-23) --------------------------------
+# The plaque failure has a signature the default mask exposes: on a flat
+# backdrop, the salient model threw away a LARGE area of pixels that look
+# nothing like the backdrop (the black plate is ~400 colour units from white).
+# When that happens, auto swaps in the backdrop key; otherwise auto is
+# untouched. "Strong" = further than RESCUE_STRONG_DIST from the backdrop.
+# Fires only when standard dropped at least MIN_DROPPED_FRAC of the frame as
+# strong pixels AND at least MIN_DROPPED_SHARE of all strong pixels.
+# Measured on 25 eval images (all 7 Kravento films, both uploads, flower,
+# gold box, chain, dog, hair, foliage, 4 flowerboxes, desks, portrait, daisy,
+# skyline): fires on the plaque ONLY (0.576 / 0.95). Next highest among flat
+# backdrops: flower 0.031 / 0.09. Every film sheet fails the flatness gate
+# (<= 0.19) before this is even measured.
+AUTO_BACKDROP_STRONG_DIST = 80.0
+AUTO_BACKDROP_MIN_DROPPED_FRAC = 0.10
+AUTO_BACKDROP_MIN_DROPPED_SHARE = 0.50
+AUTO_BACKDROP_WORK_DIM = 1024   # measure at <= this long side; key at native
 
 # ---- /replace-bg-ai (AI-generated backgrounds) ----------------------------
 # EXPERIMENT, allowlist-gated. The generative model NEVER sees the product: we
@@ -478,52 +550,68 @@ class ProductEngine:
         if alpha.size != im.size:
             alpha = alpha.resize(im.size, PILImage.LANCZOS)
 
-        # ---- guard 1: never let the refiner tile ------------------------
-        # See PRODUCT_REFINE_MAX_DIM. Refine small, then scale the alpha back.
-        longest = max(im.size)
-        if longest > PRODUCT_REFINE_MAX_DIM:
-            s = PRODUCT_REFINE_MAX_DIM / float(longest)
-            small = (max(1, int(round(im.width * s))), max(1, int(round(im.height * s))))
-            im_r = im.resize(small, PILImage.LANCZOS)
-            alpha_r = alpha.resize(small, PILImage.LANCZOS)
-            print(f"product engine: refining at {small} (native {im.size})")
-        else:
-            im_r, alpha_r = im, alpha
-
-        bgr = cv2.cvtColor(np.asarray(im_r), cv2.COLOR_RGB2BGR)
-        refined = self.refiner.refine(bgr, np.asarray(alpha_r), fast=False, L=900)
-        refined_img = PILImage.fromarray(refined)
-        if refined_img.size != im.size:
-            refined_img = refined_img.resize(im.size, PILImage.LANCZOS)
-
-        # ---- guard 2: refinement must not eat the subject ---------------
-        # Independent of guard 1 on purpose: if some future image tiles badly
-        # anyway, we ship the unrefined S3OD mask rather than a holed cutout.
+        base = np.asarray(alpha).astype(np.float32) / 255.0
         try:
-            from scipy import ndimage
+            # Fill holes with OpenCV, not scipy: scipy is not in product_image's
+            # install list, and the old guard swallowed its ImportError.
+            m = np.pad((base > 0.5).astype(np.uint8), 1)
+            ff = m.copy()
+            cv2.floodFill(ff, np.zeros((ff.shape[0] + 2, ff.shape[1] + 2), np.uint8), (0, 0), 2)
+            solid = ((ff != 2)[1:-1, 1:-1]).astype(np.uint8)
+            # Distance from the mask edge, one pass (erosion by 60 iterations
+            # on 12MP is seconds; this is milliseconds).
+            depth = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
+        except Exception as e:
+            print(f"product engine: interior map failed ({e!r})")
+            solid, depth = None, None
 
-            # Compare CONTINUOUS alpha, not a >128 threshold. The tile seams
-            # come back at ~50% alpha, which a binary test scores as "kept"
-            # while the pixel is visibly half gone. That mistake is why a 7.9%
-            # semi-transparent wash was first reported as fixed.
-            base = np.asarray(alpha).astype(np.float32) / 255.0
-            ref = np.asarray(refined_img).astype(np.float32) / 255.0
-            solid = ndimage.binary_fill_holes(base > 0.5)
-            # ignore a boundary band; only interior losses count
-            band = max(4, int(0.004 * max(im.size)))
-            interior = ndimage.binary_erosion(solid, iterations=band)
-            if interior.any():
-                drop = (base - ref)[interior]
-                lost = float((drop > 0.2).sum()) / float(interior.sum())
-                if lost > PRODUCT_REFINE_MAX_INTERIOR_LOSS:
-                    print(f"product engine: refinement made {lost:.1%} of the "
-                          f"subject interior transparent - DISCARDED, unrefined mask")
-                    refined_img = alpha
-        except Exception as e:  # a broken guard must never fail the request
-            print(f"product engine: interior guard skipped ({e!r})")
+        def refine_at(cap):
+            if cap and max(im.size) > cap:
+                s = cap / float(max(im.size))
+                small = (max(1, int(round(im.width * s))), max(1, int(round(im.height * s))))
+                im_r, alpha_r = im.resize(small, PILImage.LANCZOS), alpha.resize(small, PILImage.LANCZOS)
+            else:
+                im_r, alpha_r = im, alpha
+            bgr = cv2.cvtColor(np.asarray(im_r), cv2.COLOR_RGB2BGR)
+            out = PILImage.fromarray(self.refiner.refine(bgr, np.asarray(alpha_r), fast=False, L=900))
+            if out.size != im.size:
+                out = out.resize(im.size, PILImage.LANCZOS)
+            ref = np.asarray(out).astype(np.float32) / 255.0
+            if depth is not None:
+                # Pin the interior: refinement may only LOWER alpha inside the
+                # edge band. Deeper than that, never below the S3OD value.
+                inner = depth > PRODUCT_REFINE_EDGE_BAND * max(im.size)
+                ref = np.where(inner, np.maximum(ref, base), ref)
+            return ref
+
+        def interior_loss(ref):
+            # Continuous alpha, not >128: seams arrive at ~50% (see git 1126206).
+            if depth is None:
+                return 0.0
+            interior = depth > max(4, int(0.004 * max(im.size)))
+            if not interior.any():
+                return 0.0
+            return float(((base - ref)[interior] > 0.2).sum()) / float(interior.sum())
+
+        # Native first (clean edges), capped only as a fallback, unrefined last.
+        final = None
+        for cap in (None, PRODUCT_REFINE_MAX_DIM):
+            try:
+                ref = refine_at(cap)
+                lost = interior_loss(ref)
+            except Exception as e:  # a broken pass must never fail the request
+                print(f"product engine: refine(cap={cap}) failed ({e!r})")
+                continue
+            print(f"product engine: refine cap={cap} interior_loss={lost:.2%}")
+            if lost <= PRODUCT_REFINE_MAX_INTERIOR_LOSS:
+                final = ref
+                break
+        if final is None:
+            print("product engine: all refinement passes damaged the subject - unrefined mask")
+            final = base
 
         buf = io.BytesIO()
-        refined_img.save(buf, format="PNG")
+        PILImage.fromarray((np.clip(final, 0.0, 1.0) * 255.0 + 0.5).astype(np.uint8), mode="L").save(buf, format="PNG")
         return buf.getvalue()
 
 
@@ -738,7 +826,7 @@ class Knockout:
                 detail=(
                     "This key has been retired. Create a free account at "
                     "useknockout.com/signin — 30 images/month free, no card, "
-                    "then pay-as-you-go at $0.05/image (4x cheaper than remove.bg)."
+                    "then pay-as-you-go at $0.02/image (10x cheaper than remove.bg)."
                 ),
             )
 
@@ -993,7 +1081,7 @@ class Knockout:
                     f"{len(FREE_TIER_ENDPOINTS)} core endpoints (background "
                     "removal + helpers). Upgrade for edits, AI enhancement, "
                     "e-commerce presets & batch at useknockout.com/pricing — "
-                    "pay-as-you-go $0.05/image, no minimum."
+                    "pay-as-you-go $0.02/image, no minimum."
                 ),
             )
 
@@ -1564,8 +1652,8 @@ class Knockout:
 
     def _check_engine(self, engine: str) -> str:
         e = (engine or "standard").strip().lower()
-        if e not in ("standard", "product-v1", "auto"):
-            raise HTTPException(400, "engine must be 'standard', 'product-v1', or 'auto'")
+        if e not in ("standard", "product-v1", "auto", "backdrop"):
+            raise HTTPException(400, "engine must be 'standard', 'product-v1', 'auto', or 'backdrop'")
         return e
 
     # engine=auto routing thresholds. Tuned 2026-08-21 on the default-engine
@@ -1630,6 +1718,18 @@ class Knockout:
         worse than standard.
         """
         rgb, mask = self._acquire_mask(image_obj, detect=detect, decontaminate=decontaminate)
+
+        # Backdrop rescue: see AUTO_BACKDROP_*. Any failure here falls through
+        # to the unchanged auto path below, so rescue can never make auto worse
+        # than it was before this block existed.
+        try:
+            rescue, rsig = self._auto_should_rescue(rgb, mask)
+            print(f"engine=auto: backdrop_rescue={rescue} {rsig}")
+            if rescue:
+                return rgb, self._backdrop_key(rgb), "backdrop"
+        except Exception as e:
+            print(f"engine=auto: backdrop rescue skipped ({e!r})")
+
         esc, sig = self._auto_should_escalate(rgb, mask)
         print(f"engine=auto: escalate={esc} {sig}")
         if not esc:
@@ -1685,6 +1785,90 @@ class Knockout:
         if mask.size != rgb.size:
             mask = mask.resize(rgb.size, Image.LANCZOS)
         return rgb, mask
+
+    def _backdrop_mask(self, image_obj):
+        """Cutout by keying the flat backdrop colour. No model, no GPU.
+
+        For studio shots on a seamless single-colour background where the
+        subject has real holes (cutouts, fretwork, handles) that a salient-
+        object model fills solid or, worse, mistakes for the subject. Backdrop
+        colour is the median of the frame border, so a subject touching the
+        edges does not skew it. See BACKDROP_* constants for the tunables.
+
+        Raises 400 when the border is not a flat colour: an explicit engine
+        request gets an explicit answer, not a silent fallback.
+        """
+        rgb = image_obj.convert("RGB")
+        _, flat = self._backdrop_border(np.asarray(rgb, dtype=np.float32))
+        if flat < BACKDROP_MIN_BORDER_FRAC:
+            raise HTTPException(
+                400,
+                "engine=backdrop needs a flat single-colour background; the frame "
+                "border is not uniform. Use engine=standard or engine=auto.",
+            )
+        return rgb, self._backdrop_key(rgb)
+
+    @staticmethod
+    def _backdrop_border(arr):
+        """(backdrop colour, share of border pixels within KEY_LO of it)."""
+        H, W, _ = arr.shape
+        b = max(4, int(0.01 * max(H, W)))
+        border = np.concatenate([
+            arr[:b].reshape(-1, 3), arr[-b:].reshape(-1, 3),
+            arr[:, :b].reshape(-1, 3), arr[:, -b:].reshape(-1, 3),
+        ])
+        bg = np.median(border, axis=0)
+        flat = float((np.sqrt(((border - bg) ** 2).sum(-1)) <= BACKDROP_KEY_LO).mean())
+        return bg, flat
+
+    def _backdrop_key(self, rgb):
+        """Key out the backdrop colour at native resolution. Caller checks flatness."""
+        arr = np.asarray(rgb, dtype=np.float32)
+        H, W, _ = arr.shape
+        bg, _ = self._backdrop_border(arr)
+        dist = np.sqrt(((arr - bg) ** 2).sum(-1))
+        alpha = np.clip((dist - BACKDROP_KEY_LO) / (BACKDROP_KEY_HI - BACKDROP_KEY_LO), 0.0, 1.0)
+
+        # Refill enclosed islands unless they are real holes. Islands touching
+        # the frame are backdrop and stay. A real hole is large AND shows the
+        # backdrop colour (BACKDROP_HOLE_MAX_DIST); small specular flecks and
+        # light-coloured content (gold-box tissue) are refilled as subject.
+        try:
+            import cv2
+            hole = (alpha < 0.5).astype(np.uint8)
+            n, lab, stats, _ = cv2.connectedComponentsWithStats(hole, connectivity=8)
+            x, y, w, h, area = (stats[:, k] for k in range(5))
+            touches = (x == 0) | (y == 0) | (x + w >= W) | (y + h >= H)
+            mean_d = np.bincount(lab.ravel(), weights=dist.ravel(), minlength=n) / np.maximum(area, 1)
+            small = area < BACKDROP_HOLE_MAX_FRAC * H * W
+            fill = (~touches) & (small | (mean_d > BACKDROP_HOLE_MAX_DIST))
+            fill[0] = False  # label 0 is the non-hole region
+            alpha[fill[lab]] = 1.0  # one vectorized pass, not one scan per island
+        except Exception as e:
+            print(f"backdrop engine: hole fill skipped ({e!r})")  # best-effort
+
+        mask = Image.fromarray((alpha * 255.0).astype(np.uint8), mode="L")
+        return self._refine_alpha(rgb, mask)  # same guided filter as every other engine
+
+    def _auto_should_rescue(self, rgb, mask) -> Tuple[bool, dict]:
+        """Did the default mask make the plaque mistake? See AUTO_BACKDROP_*.
+
+        Cheap: one downscaled pass, no model. Most images exit at the flatness
+        check before the default mask is even read.
+        """
+        s = min(1.0, AUTO_BACKDROP_WORK_DIM / float(max(rgb.size)))
+        size = (max(1, round(rgb.width * s)), max(1, round(rgb.height * s)))
+        arr = np.asarray(rgb.resize(size, Image.BILINEAR) if s < 1.0 else rgb, dtype=np.float32)
+        bg, flat = self._backdrop_border(arr)
+        if flat < BACKDROP_MIN_BORDER_FRAC:
+            return False, {"flat": round(flat, 2)}
+        std = np.asarray(mask.convert("L").resize(size, Image.BILINEAR), dtype=np.float32) / 255.0
+        strong = np.sqrt(((arr - bg) ** 2).sum(-1)) > AUTO_BACKDROP_STRONG_DIST
+        dropped = strong & (std < 0.5)
+        frac = float(dropped.mean())
+        share = float(dropped.sum()) / float(max(1, int(strong.sum())))
+        fire = frac >= AUTO_BACKDROP_MIN_DROPPED_FRAC and share >= AUTO_BACKDROP_MIN_DROPPED_SHARE
+        return fire, {"flat": round(flat, 2), "dropped": round(frac, 3), "share": round(share, 2)}
 
     def _require_paid_compute(self, ctx: dict, feature: str = "This mode") -> None:
         """Gate 2x-inference modes to paying tiers. 402 for demo/free.
@@ -1860,6 +2044,9 @@ class Knockout:
             # detect/decontaminate are BiRefNet-path knobs; ignored here by design.
             rgb, mask = self._product_mask(image_obj)
             used = "product-v1"
+        elif engine == "backdrop":
+            rgb, mask = self._backdrop_mask(image_obj)  # same knob caveat as product-v1
+            used = "backdrop"
         elif engine == "auto":
             rgb, mask, used = self._acquire_mask_auto(image_obj, detect, decontaminate)
         else:
@@ -3393,6 +3580,9 @@ class Knockout:
             if engine == "product-v1":
                 _, mask = self._product_mask(image_obj)
                 used = "product-v1"
+            elif engine == "backdrop":
+                _, mask = self._backdrop_mask(image_obj)
+                used = "backdrop"
             elif engine == "auto":
                 _, mask, used = self._acquire_mask_auto(image_obj, "standard", False)
             else:
@@ -3438,6 +3628,9 @@ class Knockout:
             if engine == "product-v1":
                 rgb, mask = self._product_mask(image_obj)
                 used = "product-v1"
+            elif engine == "backdrop":
+                rgb, mask = self._backdrop_mask(image_obj)
+                used = "backdrop"
             elif engine == "auto":
                 rgb, mask, used = self._acquire_mask_auto(image_obj, detect, decontaminate)
             else:
@@ -3778,6 +3971,9 @@ class Knockout:
                 if engine == "product-v1":
                     rgb, mask = self._product_mask(image_obj)
                     used = "product-v1"
+                elif engine == "backdrop":
+                    rgb, mask = self._backdrop_mask(image_obj)
+                    used = "backdrop"
                 elif engine == "auto":
                     rgb, mask, used = self._acquire_mask_auto(image_obj, detect, decontaminate)
                 else:
@@ -4425,7 +4621,9 @@ class Knockout:
             result = rgb_small.convert("RGBA")
             result.putalpha(mask)
             resp = self._response(result, fmt)
-            self._end(ctx, "/preview", _t)
+            # Advertised as free and quota-neutral; must never fire the meter,
+            # even on paid tiers (billed a payg user on 2026-09-21).
+            self._end(ctx, "/preview", _t, skip_meter=True)
             return resp
 
         @web.post("/estimate")
